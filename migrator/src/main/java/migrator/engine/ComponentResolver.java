@@ -1,0 +1,144 @@
+package migrator.engine;
+
+import migrator.ClassMigrator;
+import migrator.commit.CommitManager;
+import migrator.commit.RollbackManager;
+import migrator.phase.MigrationPhaseListener;
+import migrator.smoke.SmokeTestRunner;
+import migrator.smoke.SmokeTest;
+
+import java.lang.reflect.Constructor;
+import java.util.Set;
+
+/**
+ * Resolves and instantiates migration components from scanned annotation results.
+ *
+ * <p>This class is responsible for:
+ * <ul>
+ *   <li>Validating that annotated classes implement the correct interfaces</li>
+ *   <li>Instantiating components using reflection (requires no-arg constructors)</li>
+ *   <li>Building the {@link SmokeTestRunner} from discovered smoke test classes</li>
+ * </ul>
+ *
+ * <p>Used internally by {@link MigrationEngine} during initialization.
+ *
+ * @see MigrationEngine
+ * @see migrator.scanner.AnnotationScanner
+ */
+public final class ComponentResolver {
+
+    /**
+     * Validates and casts a class annotated with {@code @Migrator} to the proper type.
+     *
+     * @param type the class annotated with {@code @Migrator}
+     * @return the class cast to {@code ClassMigrator<?, ?>}
+     * @throws IllegalStateException if the class does not implement ClassMigrator
+     */
+    public Class<? extends ClassMigrator<?, ?>> resolveMigrator(Class<?> type) {
+        if (!ClassMigrator.class.isAssignableFrom(type)) {
+            throw new IllegalStateException(
+                    "@Migrator must implement ClassMigrator<?, ?>: " + type.getName()
+            );
+        }
+        @SuppressWarnings("unchecked")
+        Class<? extends ClassMigrator<?, ?>> result =
+                (Class<? extends ClassMigrator<?, ?>>) type;
+        return result;
+    }
+
+    /**
+     * Instantiates a phase listener from an annotated class.
+     *
+     * @param type the class annotated with {@code @PhaseListener}
+     * @return an instance of the phase listener
+     * @throws IllegalStateException if instantiation fails or class is invalid
+     */
+    public MigrationPhaseListener resolvePhaseListener(Class<?> type) {
+        return instantiate(type, MigrationPhaseListener.class, "@PhaseListener");
+    }
+
+    /**
+     * Builds a {@link SmokeTestRunner} from a set of smoke test classes.
+     *
+     * @param smokeTestClasses classes annotated with {@code @SmokeTestComponent}
+     * @return a configured smoke test runner
+     * @throws IllegalStateException if any class cannot be instantiated
+     */
+    public SmokeTestRunner resolveSmokeTestRunner(Set<Class<?>> smokeTestClasses) {
+        SmokeTestRunner.Builder builder = new SmokeTestRunner.Builder();
+
+        for (Class<?> testClass : smokeTestClasses) {
+            SmokeTest test = instantiateSmokeTest(testClass);
+            builder.addSmokeTest(test);
+        }
+
+        return builder.build();
+    }
+
+    /**
+     * Instantiates a commit manager from an annotated class.
+     *
+     * @param type the class annotated with {@code @CommitComponent}
+     * @return an instance of the commit manager
+     * @throws IllegalStateException if instantiation fails or class is invalid
+     */
+    public CommitManager resolveCommitManager(Class<?> type) {
+        return instantiate(type, CommitManager.class, "@CommitManager");
+    }
+
+    /**
+     * Instantiates a rollback manager from an annotated class.
+     *
+     * @param type the class annotated with {@code @RollbackComponent}
+     * @return an instance of the rollback manager
+     * @throws IllegalStateException if instantiation fails or class is invalid
+     */
+    public RollbackManager resolveRollbackManager(Class<?> type) {
+        return instantiate(type, RollbackManager.class, "@RollbackManager");
+    }
+
+    private <T> T instantiate(
+            Class<?> type,
+            Class<T> expectedInterface,
+            String annotationName
+    ) {
+        if (!expectedInterface.isAssignableFrom(type)) {
+            throw new IllegalStateException(
+                    annotationName + " must implement " + expectedInterface.getSimpleName()
+                            + ": " + type.getName()
+            );
+        }
+
+        try {
+            Constructor<?> ctor = type.getDeclaredConstructor();
+            ctor.setAccessible(true);
+            return expectedInterface.cast(ctor.newInstance());
+        } catch (NoSuchMethodException e) {
+            throw new IllegalStateException(
+                    type.getName() + " must have a no-arg constructor", e
+            );
+        } catch (Exception e) {
+            throw new RuntimeException(
+                    "Failed to instantiate " + type.getName(), e
+            );
+        }
+    }
+
+    private SmokeTest instantiateSmokeTest(Class<?> type) {
+        if (!SmokeTest.class.isAssignableFrom(type)) {
+            throw new IllegalStateException(
+                    "@SmokeTestComponent must implement SmokeTest: " + type.getName()
+            );
+        }
+
+        try {
+            Constructor<?> ctor = type.getDeclaredConstructor();
+            ctor.setAccessible(true);
+            return (SmokeTest) ctor.newInstance();
+        } catch (Exception e) {
+            throw new RuntimeException(
+                    "Failed to instantiate SmokeTest: " + type.getName(), e
+            );
+        }
+    }
+}
