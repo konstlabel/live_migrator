@@ -105,8 +105,9 @@ Migrator/
 - JDK 21+
 - Maven 3.8+
 - GCC (for building native agent)
+- Docker & Docker Compose (for Docker demo)
 
-### Running the Demo
+### Running the Demo (Local)
 
 1. **Start the demo service:**
    ```bash
@@ -124,6 +125,38 @@ Migrator/
    - Service continues running without interruption
    - All `OldUser` instances are replaced with `NewUser`
    - New users created after migration are `NewUser` instances
+
+### Running the Demo (Docker)
+
+1. **Build and start the service:**
+   ```bash
+   docker compose -f examples/docker-compose.yml build
+   docker compose -f examples/docker-compose.yml up -d service
+   ```
+
+2. **Wait for the service to become healthy:**
+   ```bash
+   docker compose -f examples/docker-compose.yml ps
+   ```
+
+3. **Run the migration:**
+   ```bash
+   docker compose -f examples/docker-compose.yml --profile migrate up migrator
+   ```
+   Or use the helper script:
+   ```bash
+   ./examples/docker-migrate.sh
+   ```
+
+4. **Check service logs to see migration results:**
+   ```bash
+   docker compose -f examples/docker-compose.yml logs service
+   ```
+
+5. **Clean up:**
+   ```bash
+   docker compose -f examples/docker-compose.yml --profile migrate down -v
+   ```
 
 ## Core Concepts
 
@@ -811,7 +844,6 @@ java -agentpath:/path/to/libagent.so \
 ## Building
 
 ```bash
-# Build everything
 # Build the library only
 mvn clean install
 
@@ -825,4 +857,7 @@ gcc -fPIC \
     -shared \
     -o agent/libagent.so \
     agent/agent.c
+
+# Build Docker images
+docker compose -f examples/docker-compose.yml build
 ```
