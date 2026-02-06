@@ -196,14 +196,15 @@ MigrationEngine.createAndMigrate(Set.of(ServiceMain.class));
 // With custom classloader and JAR path
 MigrationEngine.createAndMigrate(
     classesToScan,
-    fullHeapWalk,
     classLoader,
     jarPath
 );
 
 // With generic container updates
 MigrationEngine.createAndMigrate(
-    Set.of(ServiceMain.class),
+    classesToScan,
+    classLoader,
+    jarPath,
     List.of(userCache, userRegistry),   // Containers to update
     User.class                          // Common interface type
 );
@@ -415,7 +416,6 @@ registryUpdater.updateGenericContainers(containers, User.class);
            ClassLoader cl = MigrationAgent.class.getClassLoader();
            MigrationEngine.createAndMigrate(
                Set.of(ServiceMain.class),
-               false,
                cl,
                agentArgs
            );
