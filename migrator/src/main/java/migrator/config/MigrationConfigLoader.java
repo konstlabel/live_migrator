@@ -107,7 +107,6 @@ public final class MigrationConfigLoader {
         }
     }
 
-    @SuppressWarnings("unchecked")
     private static MigrationConfig loadYaml(InputStream is, String source) {
         Map<String, Object> root = new Yaml().load(is);
         if (root == null) {

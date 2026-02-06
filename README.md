@@ -239,8 +239,10 @@ Marks a class that handles commit logic after successful migration.
 
 ```java
 @CommitComponent
-public class MyCommitManager implements CommitManager {
-    public void commit() { /* cleanup, delete checkpoints */ }
+public class MyCommitManager extends CommitManager {
+    public MyCommitManager() {
+        super(new MyCracController());
+    }
 }
 ```
 
@@ -250,8 +252,10 @@ Marks a class that handles rollback if migration fails.
 
 ```java
 @RollbackComponent
-public class MyRollbackManager implements RollbackManager {
-    public void rollback() { /* restore previous state */ }
+public class MyRollbackManager extends RollbackManager {
+    public MyRollbackManager() {
+        super(new MyCracController());
+    }
 }
 ```
 
@@ -270,9 +274,9 @@ public class MyPhaseListener implements MigrationPhaseListener {
 **MigrationContext provides:**
 | Method | Description |
 |--------|-------------|
-| `getMigrationId()` | Current migration identifier |
-| `getObjectsMigrated()` | Count of objects migrated so far |
-| `getForwardingTable()` | Access to old→new object mappings |
+| `migrationId()` | Current migration identifier |
+| `plan()` | The migration plan being executed |
+| `startedAtNanos()` | Timestamp when migration started (in nanos) |
 
 ### @SmokeTestComponent
 
@@ -283,7 +287,7 @@ Marks a class that performs smoke tests after migration. Multiple smoke test com
 public class MySmokeTest implements SmokeTest {
     public SmokeTestResult run(Map<MigratorDescriptor, List<Object>> migrated) {
         // Verify migrated objects
-        return SmokeTestResult.success();
+        return SmokeTestResult.ok("my-smoke-test");
     }
 }
 ```
@@ -291,12 +295,12 @@ public class MySmokeTest implements SmokeTest {
 **SmokeTestResult methods:**
 | Method | Description |
 |--------|-------------|
-| `success()` | Create a successful result |
-| `failure(message)` | Create a failed result with message |
-| `failure(message, cause)` | Create a failed result with message and exception |
-| `isSuccess()` | Check if the test passed |
-| `getMessage()` | Get failure message (if failed) |
-| `getCause()` | Get cause exception (if any) |
+| `ok(name)` | Create a successful result with test name |
+| `fail(name, message, error)` | Create a failed result with name, message, and optional exception |
+| `isOk()` | Check if the test passed |
+| `name()` | Get the test name |
+| `message()` | Get failure message (if failed) |
+| `error()` | Get cause exception (if any) |
 
 ### @UpdateRegistry
 
@@ -305,9 +309,9 @@ Marks fields (typically static) as registries/caches that should be updated.
 **Attributes:**
 | Attribute | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `replaceKeys` | boolean | false | Replace keys in Map-type registries |
+| `replaceKeys` | boolean | true | Replace keys in Map-type registries |
 | `replaceValues` | boolean | true | Replace values in Map-type registries |
-| `deep` | boolean | false | Recursively update nested containers |
+| `deep` | boolean | true | Recursively update nested containers |
 | `reflective` | boolean | false | Use reflection for custom container types |
 
 ```java
@@ -590,8 +594,7 @@ registryUpdater.updateGenericContainers(containers, User.class);
 | `migrationId()` | Get migration identifier |
 | `status()` | Get final status (SUCCESS/FAILED) |
 | `timestamp()` | Get completion timestamp |
-| `durationMs()` | Get duration in milliseconds |
-| `objectsMigrated()` | Get count of migrated objects |
+| `metrics()` | Get migration metrics (contains duration, object counts, etc.) |
 | `errorMessage()` | Get error message (if failed) |
 
 ### RegistryUpdater
@@ -609,9 +612,10 @@ Describes a migrator class and its type mappings (used in smoke tests and metric
 
 | Method | Description |
 |--------|-------------|
-| `migratorClass()` | Get the migrator implementation class |
-| `sourceType()` | Get the source (old) type being migrated |
-| `targetType()` | Get the target (new) type after migration |
+| `migrator()` | Get the migrator implementation instance |
+| `from()` | Get the source (old) class type being migrated |
+| `to()` | Get the target (new) class type after migration |
+| `commonInterface()` | Get the common interface shared by source and target |
 
 ### AgentLoader
 

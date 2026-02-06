@@ -11,6 +11,9 @@ import migrator.plan.MigrationPlan;
  *   <li>A unique migration ID for logging/tracking</li>
  *   <li>Timing information</li>
  * </ul>
+ *
+ * @see MigrationPhaseListener
+ * @see MigrationPlan
  */
 public final class MigrationContext {
 
@@ -18,6 +21,12 @@ public final class MigrationContext {
     private final long migrationId;
     private final long startedAtNanos;
 
+    /**
+     * Creates a new migration context.
+     *
+     * @param plan the migration plan being executed
+     * @param migrationId unique identifier for this migration execution
+     */
     public MigrationContext(MigrationPlan plan, long migrationId) {
         this.plan = plan;
         this.migrationId = migrationId;

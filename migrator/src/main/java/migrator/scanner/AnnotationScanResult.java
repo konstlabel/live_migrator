@@ -14,7 +14,11 @@ import java.util.Set;
  *   <li>{@link #smokeTests()} - all classes annotated with {@link migrator.annotations.SmokeTestComponent}</li>
  * </ul>
  *
+ * <p>This class is typically created by {@link AnnotationScanner} and passed to the
+ * migration engine for component instantiation.
+ *
  * @see AnnotationScanner
+ * @see migrator.engine.ComponentResolver
  */
 public final class AnnotationScanResult {
 
@@ -24,6 +28,15 @@ public final class AnnotationScanResult {
     private final Class<?> rollbackManager;
     private final Set<Class<?>> smokeTests;
 
+    /**
+     * Creates a new annotation scan result.
+     *
+     * @param migrator the class annotated with @Migrator
+     * @param phaseListener the class annotated with @PhaseListener
+     * @param commitManager the class annotated with @CommitComponent
+     * @param rollbackManager the class annotated with @RollbackComponent
+     * @param smokeTests all classes annotated with @SmokeTestComponent
+     */
     public AnnotationScanResult(
             Class<?> migrator,
             Class<?> phaseListener,

@@ -8,16 +8,30 @@ import java.util.Objects;
 /**
  * Manages rollback by restoring from checkpoint via {@link CracController}.
  *
+ * <p>The rollback manager is invoked when migration fails (e.g., smoke test failure,
+ * timeout, or exception during migration). It attempts to restore the application
+ * to its pre-migration state using CRaC checkpoint restore.
+ *
  * <p><strong>Warning:</strong> The {@link #rollback()} method may not return
- * if the checkpoint restore replaces the current process.
+ * if the checkpoint restore replaces the current process. When restore succeeds,
+ * execution resumes from the checkpoint, and the caller's stack is discarded.
+ *
+ * <p>Annotate your implementation with {@link migrator.annotations.RollbackComponent}
+ * for automatic discovery during classpath scanning.
  *
  * @see CommitManager
  * @see CracController
+ * @see migrator.annotations.RollbackComponent
  */
 public class RollbackManager {
 
     private final CracController cracController;
 
+    /**
+     * Creates a new rollback manager.
+     *
+     * @param cracController the CRaC controller for checkpoint operations (must not be null)
+     */
     public RollbackManager(CracController cracController) {
         this.cracController = Objects.requireNonNull(cracController);
     }

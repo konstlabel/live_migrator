@@ -20,9 +20,11 @@ import migrator.ClassMigrator;
  *
  * <p>The common interface is inferred automatically by searching the class
  * hierarchy for an interface implemented by both the source and target types.
+ * This interface is used for type-safe container updates during migration.
  *
  * @see ClassMigrator
  * @see MigrationPlan
+ * @see migrator.registry.RegistryUpdater
  */
 public final class MigratorDescriptor {
 
@@ -31,6 +33,21 @@ public final class MigratorDescriptor {
     private final ClassMigrator<?, ?> migrator;
     private final Class<?> commonInterface;
 
+    /**
+     * Creates a new migrator descriptor from the given migrator class.
+     *
+     * <p>The migrator class must:
+     * <ul>
+     *   <li>Implement {@code ClassMigrator<OldT, NewT>} with concrete type parameters</li>
+     *   <li>Have a public no-arg constructor</li>
+     *   <li>Have source and target types that share a common interface</li>
+     * </ul>
+     *
+     * @param migratorClass the migrator implementation class
+     * @throws IllegalArgumentException if the class cannot be instantiated,
+     *         doesn't implement ClassMigrator with type parameters, or if
+     *         source and target types don't share a common interface
+     */
     public MigratorDescriptor(Class<? extends ClassMigrator<?, ?>> migratorClass) {
         try {
             this.migrator = migratorClass.getDeclaredConstructor().newInstance();
