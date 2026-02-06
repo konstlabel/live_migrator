@@ -539,9 +539,9 @@ Java_migrator_heap_NativeHeapWalker_nativeWalkHeap(JNIEnv *env, jobject thisObj)
  */
 JNIEXPORT jobjectArray JNICALL
 Java_migrator_heap_NativeHeapWalker_nativeWalkHeapFiltered(
-    JNIEnv *env, jclass cls, jobjectArray classNamesArray) {
+    JNIEnv *env, jobject thisObj, jobjectArray classNamesArray) {
 
-    (void) cls;
+    (void) thisObj;
 
     if (!g_jvmti || !env || classNamesArray == NULL) return NULL;
 
