@@ -540,12 +540,6 @@ public final class MigrationEngine {
                     firstPassAllocateAndMigrate(allResolvedOldObjects, createdPerMigrator));
             MigrationAlertLogger.phaseCompleted(migrationId, Phase.FIRST_PASS, System.currentTimeMillis() - phaseStart);
 
-            int totalMigrated = createdPerMigrator.values().stream().mapToInt(List::size).sum();
-            metricsCollector.objectsMigrated(totalMigrated);
-
-            Set<Object> pass2Objects = new LinkedHashSet<>(allResolvedOldObjects);
-            createdPerMigrator.values().forEach(pass2Objects::addAll);
-
             // CRITICAL PHASE
             MigrationState.getInstance().setCurrentPhase(Phase.CRITICAL_PHASE);
             MigrationAlertLogger.phaseStarted(migrationId, Phase.CRITICAL_PHASE);
@@ -555,6 +549,22 @@ public final class MigrationEngine {
                 // partial quiesce is resumed by the finally block.
                 beforeCriticalCalled[0] = true;
                 signalBeforeCriticalPhase(ctx);
+
+                // Straggler rescan under quiescence. The first-pass snapshot ran *before* the
+                // application was quiesced, so new instances of a source class may have been created
+                // in the snapshot-to-quiesce window — they would otherwise miss the forwarding table
+                // and never be migrated. Now that onBeforeCriticalPhase has paused the application
+                // (which, per the MigrationPhaseListener contract, must stop creating source-class
+                // instances), re-run each migrator: processMigrator's forwarding.contains guard makes
+                // this idempotent, so only the stragglers are migrated and appended.
+                rescanStragglersUnderQuiescence(allResolvedOldObjects, createdPerMigrator);
+
+                // Build the pass-2 working set AFTER the rescan so stragglers (and their new objects)
+                // are patched too, and refresh the migrated-object count for metrics.
+                metricsCollector.objectsMigrated(
+                        createdPerMigrator.values().stream().mapToInt(List::size).sum());
+                Set<Object> pass2Objects = new LinkedHashSet<>(allResolvedOldObjects);
+                createdPerMigrator.values().forEach(pass2Objects::addAll);
 
                 // Compute the set of classes that may hold references to migrated objects once,
                 // then reuse it for both the filtered heap walk and static-field patching.
@@ -741,6 +751,24 @@ public final class MigrationEngine {
         }
     }
 
+    /**
+     * Re-runs the migrators under quiescence to catch source-class instances created after the
+     * first-pass snapshot but before the application was paused. Because {@link #processMigrator}
+     * skips objects already in the forwarding table, this is idempotent for already-migrated objects
+     * and migrates only the stragglers, appending them to {@code createdPerMigrator}.
+     */
+    private void rescanStragglersUnderQuiescence(
+        Set<Object> allResolvedOldObjects,
+        Map<MigratorDescriptor, List<Object>> createdPerMigrator
+    ) throws MigrateException {
+        int before = createdPerMigrator.values().stream().mapToInt(List::size).sum();
+        firstPassAllocateAndMigrate(allResolvedOldObjects, createdPerMigrator);
+        int caught = createdPerMigrator.values().stream().mapToInt(List::size).sum() - before;
+        if (caught > 0) {
+            log.info("Straggler rescan under quiescence migrated {} object(s) created during the first pass", caught);
+        }
+    }
+
     /** Signals the phase listener to quiesce before the critical phase, under the critical-phase timeout. */
     private void signalBeforeCriticalPhase(MigrationContext ctx) throws MigrateException {
         try {
@@ -776,8 +804,9 @@ public final class MigrationEngine {
         );
         if (objects == null || objects.length == 0) return;
 
-        List<Object> createdForThisMigrator = new ArrayList<>();
-        createdPerMigrator.put(desc, createdForThisMigrator);
+        // computeIfAbsent (not put): the straggler rescan re-runs this method under quiescence, and
+        // must append newly-migrated objects to the list from the first pass rather than replace it.
+        List<Object> createdForThisMigrator = createdPerMigrator.computeIfAbsent(desc, d -> new ArrayList<>());
 
         for (Object oldObj : objects) {
             if (oldObj == null || forwarding.contains(oldObj)) {

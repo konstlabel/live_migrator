@@ -34,6 +34,15 @@ public interface MigrationPhaseListener {
      * and registries updated. The application SHOULD be in a safe state (mutations
      * quiesced) when this method returns.
      *
+     * <p><b>Completeness contract.</b> The first-pass snapshot of source-class instances is taken
+     * <em>before</em> this callback, while the application is still live, so any instance created
+     * between the snapshot and quiescence would otherwise be missed. To guarantee that
+     * <em>all</em> instances are migrated, this method MUST, before it returns, stop the application
+     * from creating new instances of any source class (e.g. close the relevant factories / request
+     * intake). The engine then performs a <em>straggler rescan</em> under quiescence to migrate any
+     * instances created during that window. If the application keeps producing source-class
+     * instances after this returns, those instances will not be migrated.
+     *
      * <p>Implementations may throw an exception to refuse the migration.
      *
      * @param ctx migration context

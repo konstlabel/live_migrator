@@ -59,6 +59,15 @@ public class ServiceMain {
     private static final Logger log = LoggerFactory.getLogger(ServiceMain.class);
     public static final List<User> users = new CopyOnWriteArrayList<>();
     private static final AtomicInteger idCounter = new AtomicInteger(1);
+
+    /**
+     * Intake gate for new users. The migration phase listener flips this to {@code false} in
+     * {@code onBeforeCriticalPhase} (and back to {@code true} in {@code onAfterCriticalPhase}) so the
+     * application stops creating source-class instances while the engine runs its straggler rescan
+     * under quiescence — guaranteeing every {@code OldUser} is migrated. See MigrationPhaseListener.
+     */
+    public static final java.util.concurrent.atomic.AtomicBoolean acceptingUsers =
+            new java.util.concurrent.atomic.AtomicBoolean(true);
     private static final long startTimeMs = System.currentTimeMillis();
 
     public static void main(String[] args) throws Exception {
@@ -147,6 +156,13 @@ public class ServiceMain {
             if (!parsed.isEmpty()) {
                 name = parsed;
             }
+        }
+
+        // Intake is closed while the migration is in its critical (quiesced) phase, so no new
+        // source-class instances are created during the engine's straggler rescan.
+        if (!acceptingUsers.get()) {
+            sendResponse(exchange, 503, "Service temporarily not accepting new users (migration in progress)\n");
+            return;
         }
 
         // Use factory to create user - after migration this will create NewUser
