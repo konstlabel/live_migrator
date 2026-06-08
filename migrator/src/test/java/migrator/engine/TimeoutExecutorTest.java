@@ -6,12 +6,17 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+/**
+ * Unit tests for {@link TimeoutExecutor}.
+ */
 @DisplayName("TimeoutExecutor")
 class TimeoutExecutorTest {
 
@@ -102,6 +107,32 @@ class TimeoutExecutorTest {
             ))
                     .isInstanceOf(OutOfMemoryError.class)
                     .hasMessage("test OOM");
+        }
+
+        @Test
+        @DisplayName("should interrupt the worker thread when the operation times out")
+        void shouldInterruptWorkerThreadOnTimeout() throws InterruptedException {
+            AtomicBoolean interrupted = new AtomicBoolean(false);
+            CountDownLatch done = new CountDownLatch(1);
+
+            assertThatThrownBy(() -> TimeoutExecutor.executeWithTimeout(
+                    "interruptible",
+                    Duration.ofMillis(50),
+                    () -> {
+                        try {
+                            Thread.sleep(5000);
+                        } catch (InterruptedException e) {
+                            interrupted.set(true); // worker actually received the interrupt
+                        } finally {
+                            done.countDown();
+                        }
+                        return "never";
+                    }
+            )).isInstanceOf(MigrationTimeoutException.class);
+
+            // The worker must observe the interrupt promptly, not run the full 5s sleep.
+            assertThat(done.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThat(interrupted.get()).isTrue();
         }
 
         @Test

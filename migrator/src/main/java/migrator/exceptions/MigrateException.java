@@ -11,13 +11,20 @@ package migrator.exceptions;
  *   <li>The migration stage where failure occurred</li>
  * </ul>
  *
- * <p>All diagnostic fields are serialization-safe strings to avoid holding
- * references to potentially problematic objects.
+ * <p>The offending object is captured as a safe string ({@link #getObjectIdStr()})
+ * rather than by reference, so a problematic object is never retained. Note that
+ * {@code from}/{@code to} are held as {@link Class} references; retaining such an
+ * exception long-term can pin the classloader that defined those classes.
  *
  * @see migrator.engine.MigrationEngine
  * @see migrator.ClassMigrator
  */
 public class MigrateException extends Exception {
+
+    private static final long serialVersionUID = 1L;
+
+    /** Maximum length of an embedded object {@code toString()} in diagnostics. */
+    private static final int MAX_DESC_LEN = 512;
 
     /** Safe diagnostic representation of object involved in failure */
     private final String objectIdStr;
@@ -108,6 +115,14 @@ public class MigrateException extends Exception {
 
     // ---------------- helpers ----------------
 
+    /**
+     * Builds a serialization-safe description of an object: its class name and identity
+     * hash, plus its {@code toString()} when available. Guards against {@code toString()}
+     * returning null or throwing, so it never fails.
+     *
+     * @param o the object to describe (may be null)
+     * @return a non-null diagnostic string
+     */
     private static String safeDescribe(Object o) {
         if (o == null) return "null";
         try {
@@ -115,10 +130,15 @@ public class MigrateException extends Exception {
             if (s == null) {
                 return o.getClass().getName() + "@" + System.identityHashCode(o);
             }
-            return o.getClass().getName() + "@" + System.identityHashCode(o) + " [" + s + "]";
+            return o.getClass().getName() + "@" + System.identityHashCode(o) + " [" + truncate(s) + "]";
         } catch (Exception e) {
             return o.getClass().getName() + "@" + System.identityHashCode(o) + " [toString failed]";
         }
+    }
+
+    /** Caps an embedded {@code toString()} so a large object can't bloat the diagnostic message. */
+    private static String truncate(String s) {
+        return s.length() <= MAX_DESC_LEN ? s : s.substring(0, MAX_DESC_LEN) + "…(truncated)";
     }
 
     // ---------------- getters ----------------
@@ -170,10 +190,16 @@ public class MigrateException extends Exception {
 
     // ---------------- diagnostics ----------------
 
+    /**
+     * Returns the base message augmented with whatever diagnostic context is available
+     * (stage, source/target types, and a safe description of the offending object).
+     *
+     * @return the message with appended diagnostic details
+     */
     @Override
     public String getMessage() {
         String base = super.getMessage();
-        StringBuilder sb = new StringBuilder(base);
+        StringBuilder sb = new StringBuilder(base != null ? base : "");
 
         if (stage != null) sb.append(" [stage=").append(stage).append("]");
         if (from != null) sb.append(" [from=").append(from.getName()).append("]");

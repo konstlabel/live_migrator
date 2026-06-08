@@ -42,8 +42,15 @@ public interface MigrationPhaseListener {
     void onBeforeCriticalPhase(MigrationContext ctx) throws MigrateException;
 
     /**
-     * Called after completing the critical phase. Always called if
-     * onBeforeCriticalPhase was called (even if migration failed).
+     * Called after the critical phase to resume normal operation. Invoked whenever
+     * {@link #onBeforeCriticalPhase} was entered — including when it threw partway through, and
+     * when the migration failed — so that anything quiesced in the "before" callback is always
+     * released.
+     *
+     * <p><b>At-least-once / idempotency:</b> on the failure path this may be invoked more than
+     * once (e.g. once during normal teardown and again from the engine's safety-net finally if the
+     * first attempt threw). Implementations MUST be idempotent: resuming an already-resumed
+     * application must be a harmless no-op.
      *
      * <p>Implementations should resume normal operation when this returns.
      *

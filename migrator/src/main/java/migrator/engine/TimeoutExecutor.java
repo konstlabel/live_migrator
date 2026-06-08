@@ -57,7 +57,10 @@ public final class TimeoutExecutor {
 
         log.debug("Executing '{}' with timeout of {} ms", operation, timeout.toMillis());
 
-        CompletableFuture<T> future = CompletableFuture.supplyAsync(supplier, EXECUTOR);
+        // Submit to the ExecutorService (not CompletableFuture.supplyAsync): only a Future from
+        // submit() honours cancel(true) by interrupting the worker thread, so a timed-out operation
+        // is actually signalled to stop rather than left running concurrently with rollback.
+        Future<T> future = EXECUTOR.submit((Callable<T>) supplier::get);
 
         try {
             return future.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
@@ -71,10 +74,10 @@ public final class TimeoutExecutor {
             throw new MigrationTimeoutException(operation, timeout, e);
         } catch (ExecutionException e) {
             Throwable cause = e.getCause();
-            if (cause instanceof RuntimeException) {
-                throw (RuntimeException) cause;
-            } else if (cause instanceof Error) {
-                throw (Error) cause;
+            if (cause instanceof Error err) {
+                throw err;
+            } else if (cause instanceof RuntimeException re) {
+                throw re;
             } else {
                 throw new RuntimeException("Operation '" + operation + "' failed", cause);
             }
@@ -121,13 +124,9 @@ public final class TimeoutExecutor {
 
         log.debug("Executing '{}' with timeout of {} ms (checked)", operation, timeout.toMillis());
 
-        CompletableFuture<T> future = CompletableFuture.supplyAsync(() -> {
-            try {
-                return callable.call();
-            } catch (Exception e) {
-                throw new CompletionException(e);
-            }
-        }, EXECUTOR);
+        // submit() runs the Callable directly (checked exceptions propagate as the ExecutionException
+        // cause) and gives a Future whose cancel(true) interrupts the worker on timeout.
+        Future<T> future = EXECUTOR.submit(callable);
 
         try {
             return future.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
@@ -141,13 +140,10 @@ public final class TimeoutExecutor {
             throw new MigrationTimeoutException(operation, timeout, e);
         } catch (ExecutionException e) {
             Throwable cause = e.getCause();
-            if (cause instanceof CompletionException && cause.getCause() != null) {
-                cause = cause.getCause();
-            }
-            if (cause instanceof Exception) {
-                throw (Exception) cause;
-            } else if (cause instanceof Error) {
-                throw (Error) cause;
+            if (cause instanceof Error err) {
+                throw err;
+            } else if (cause instanceof Exception ex) {
+                throw ex;
             } else {
                 throw new RuntimeException("Operation '" + operation + "' failed", cause);
             }

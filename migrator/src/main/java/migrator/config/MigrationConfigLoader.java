@@ -92,12 +92,20 @@ public final class MigrationConfigLoader {
         return loadFromFile(Path.of(path));
     }
 
+    /** Opens a classpath resource by name, or null if it does not exist. Tries the thread
+     * context classloader first (so app-supplied config is found), then this class's loader. */
     private static InputStream getResource(String name) {
+        ClassLoader ctx = Thread.currentThread().getContextClassLoader();
+        if (ctx != null) {
+            InputStream is = ctx.getResourceAsStream(name);
+            if (is != null) return is;
+        }
         return MigrationConfigLoader.class.getClassLoader().getResourceAsStream(name);
     }
 
+    /** Parses a {@code .properties} stream into a config, closing the stream. */
     private static MigrationConfig loadProperties(InputStream is, String source) {
-        try {
+        try (is) {
             Properties props = new Properties();
             props.load(is);
             log.info("Loaded config from {}", source);
@@ -107,30 +115,37 @@ public final class MigrationConfigLoader {
         }
     }
 
+    /** Parses a YAML stream by flattening its nested maps into dotted property keys, closing the stream. */
     private static MigrationConfig loadYaml(InputStream is, String source) {
-        Map<String, Object> root = new Yaml().load(is);
-        if (root == null) {
-            return MigrationConfig.DEFAULTS;
+        try (is) {
+            Map<String, Object> root = new Yaml().load(is);
+            if (root == null) {
+                return MigrationConfig.DEFAULTS;
+            }
+            Properties props = new Properties();
+            flatten("", root, props);
+            log.info("Loaded config from {}", source);
+            return parse(props);
+        } catch (IOException e) {
+            throw new MigrationConfigException("Failed to load " + source, e);
         }
-        Properties props = new Properties();
-        flatten("", root, props);
-        log.info("Loaded config from {}", source);
-        return parse(props);
     }
 
-    @SuppressWarnings("unchecked")
-    private static void flatten(String prefix, Map<String, Object> map, Properties props) {
+    /** Recursively flattens a nested YAML map into dotted keys (e.g. {@code a.b.c}) in {@code props}. */
+    private static void flatten(String prefix, Map<?, ?> map, Properties props) {
         for (var entry : map.entrySet()) {
-            String key = prefix.isEmpty() ? entry.getKey() : prefix + "." + entry.getKey();
+            String rawKey = String.valueOf(entry.getKey());
+            String key = prefix.isEmpty() ? rawKey : prefix + "." + rawKey;
             Object val = entry.getValue();
-            if (val instanceof Map) {
-                flatten(key, (Map<String, Object>) val, props);
+            if (val instanceof Map<?, ?> nested) {
+                flatten(key, nested, props);
             } else if (val != null) {
                 props.setProperty(key, val.toString());
             }
         }
     }
 
+    /** Builds a {@link MigrationConfig} from properties, ignoring unparseable values (logged as warnings). */
     private static MigrationConfig parse(Properties props) {
         MigrationConfig.Builder b = MigrationConfig.builder();
 
@@ -151,6 +166,7 @@ public final class MigrationConfigLoader {
 
         getInt(props, "migration.history.size").ifPresent(v -> {
             if (v > 0) b.historySize(v);
+            else log.warn("Ignoring non-positive history.size: {}", v);
         });
 
         getString(props, "migration.alert.level").ifPresent(v -> {
@@ -164,12 +180,14 @@ public final class MigrationConfigLoader {
         return b.build();
     }
 
+    /** Reads a key, preferring a matching system property over the file value; trims whitespace. */
     private static java.util.Optional<String> getString(Properties props, String key) {
         String val = System.getProperty(key);
         if (val == null) val = props.getProperty(key);
         return val != null ? java.util.Optional.of(val.trim()) : java.util.Optional.empty();
     }
 
+    /** Reads a key as a long, returning empty (and logging a warning) when not a valid number. */
     private static java.util.Optional<Long> getLong(Properties props, String key) {
         return getString(props, key).flatMap(v -> {
             try {
@@ -181,6 +199,7 @@ public final class MigrationConfigLoader {
         });
     }
 
+    /** Reads a key as an int, returning empty (and logging a warning) when not a valid number. */
     private static java.util.Optional<Integer> getInt(Properties props, String key) {
         return getString(props, key).flatMap(v -> {
             try {

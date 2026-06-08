@@ -14,8 +14,9 @@ import java.util.Objects;
  *   <li>Smoke test execution</li>
  * </ul>
  *
- * <p>All timeouts default to {@link #NO_TIMEOUT} (disabled). Use the builder
- * or setter methods to configure specific timeouts.
+ * <p>All timeouts default to {@link #NO_TIMEOUT} (disabled). Use the {@link Builder}
+ * to configure specific timeouts; instances are immutable. Any non-positive duration
+ * (zero or negative) is treated as {@link #NO_TIMEOUT}.
  *
  * <h2>Example:</h2>
  * <pre>
@@ -88,7 +89,7 @@ public final class MigrationTimeoutConfig {
     /**
      * Timeout for heap snapshot creation.
      *
-     * <p>This timeout applies to {@code HeapWalker.snapshot(Class)}.
+     * <p>This timeout applies to {@code HeapWalker.snapshotObjects(Class)}.
      *
      * @return the heap snapshot timeout, or {@link #NO_TIMEOUT} if disabled
      */
@@ -133,6 +134,21 @@ public final class MigrationTimeoutConfig {
     }
 
     @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof MigrationTimeoutConfig other)) return false;
+        return heapWalkTimeout.equals(other.heapWalkTimeout)
+                && heapSnapshotTimeout.equals(other.heapSnapshotTimeout)
+                && criticalPhaseTimeout.equals(other.criticalPhaseTimeout)
+                && smokeTestTimeout.equals(other.smokeTestTimeout);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(heapWalkTimeout, heapSnapshotTimeout, criticalPhaseTimeout, smokeTestTimeout);
+    }
+
+    @Override
     public String toString() {
         return "MigrationTimeoutConfig{" +
                 "heapWalk=" + formatTimeout(heapWalkTimeout) +
@@ -164,7 +180,7 @@ public final class MigrationTimeoutConfig {
          * @return this builder
          */
         public Builder heapWalkTimeout(Duration timeout) {
-            this.heapWalkTimeout = Objects.requireNonNull(timeout, "timeout");
+            this.heapWalkTimeout = normalize(timeout);
             return this;
         }
 
@@ -185,7 +201,7 @@ public final class MigrationTimeoutConfig {
          * @return this builder
          */
         public Builder heapSnapshotTimeout(Duration timeout) {
-            this.heapSnapshotTimeout = Objects.requireNonNull(timeout, "timeout");
+            this.heapSnapshotTimeout = normalize(timeout);
             return this;
         }
 
@@ -206,7 +222,7 @@ public final class MigrationTimeoutConfig {
          * @return this builder
          */
         public Builder criticalPhaseTimeout(Duration timeout) {
-            this.criticalPhaseTimeout = Objects.requireNonNull(timeout, "timeout");
+            this.criticalPhaseTimeout = normalize(timeout);
             return this;
         }
 
@@ -227,7 +243,7 @@ public final class MigrationTimeoutConfig {
          * @return this builder
          */
         public Builder smokeTestTimeout(Duration timeout) {
-            this.smokeTestTimeout = Objects.requireNonNull(timeout, "timeout");
+            this.smokeTestTimeout = normalize(timeout);
             return this;
         }
 
@@ -248,12 +264,22 @@ public final class MigrationTimeoutConfig {
          * @return this builder
          */
         public Builder allTimeouts(Duration timeout) {
-            Objects.requireNonNull(timeout, "timeout");
-            this.heapWalkTimeout = timeout;
-            this.heapSnapshotTimeout = timeout;
-            this.criticalPhaseTimeout = timeout;
-            this.smokeTestTimeout = timeout;
+            Duration normalized = normalize(timeout);
+            this.heapWalkTimeout = normalized;
+            this.heapSnapshotTimeout = normalized;
+            this.criticalPhaseTimeout = normalized;
+            this.smokeTestTimeout = normalized;
             return this;
+        }
+
+        /**
+         * Normalizes a timeout: non-null required, and any non-positive (zero or negative) duration
+         * collapses to {@link #NO_TIMEOUT}. This keeps the {@code Duration} setters consistent with
+         * the {@code *Seconds} setters and guarantees getters never return a negative duration.
+         */
+        private static Duration normalize(Duration timeout) {
+            Objects.requireNonNull(timeout, "timeout");
+            return (timeout.isZero() || timeout.isNegative()) ? NO_TIMEOUT : timeout;
         }
 
         /**

@@ -28,9 +28,10 @@ import migrator.exceptions.MigrateException;
  * }
  * </pre>
  *
- * <h2>Thread Safety:</h2>
- * <p>Implementations should be stateless or thread-safe, as the migration engine
- * may invoke {@link #migrate(Object)} from multiple threads concurrently.
+ * <h2>Statelessness:</h2>
+ * <p>Implementations should be stateless and free of external side effects. The engine
+ * invokes {@link #migrate(Object)} once per discovered instance; keep it idempotent so a
+ * re-run is safe.
  *
  * @param <OldT> the source class type being migrated from
  * @param <NewT> the target class type being migrated to

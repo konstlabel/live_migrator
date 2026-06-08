@@ -15,15 +15,12 @@ import migrator.phase.MigrationContext;
 import migrator.phase.MigrationPhaseListener;
 import migrator.plan.MigratorDescriptor;
 import migrator.plan.MigrationPlan;
-import migrator.smoke.SmokeTest;
 import migrator.smoke.SmokeTestReport;
 import migrator.smoke.SmokeTestResult;
 import migrator.smoke.SmokeTestRunner;
-import migrator.smoke.HealthCheck;
 import migrator.state.MigrationState;
 import migrator.state.MigrationHistoryEntry;
 import org.junit.jupiter.api.*;
-import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 
 import java.time.Duration;
 import java.util.*;
@@ -614,7 +611,7 @@ class MigrationEngineIntegrationTest {
             MigrationState.getInstance().migrationStarted(1L);
 
             MigrationMetrics metrics = createTestMetrics(1L);
-            MigrationState.getInstance().migrationCompleted(metrics);
+            MigrationState.getInstance().migrationCompleted(1L, metrics);
 
             assertThat(MigrationState.getInstance().getStatus())
                     .isEqualTo(MigrationState.Status.SUCCESS);
@@ -627,7 +624,7 @@ class MigrationEngineIntegrationTest {
             MigrationState.getInstance().migrationStarted(1L);
 
             MigrationState.getInstance().migrationFailed(
-                    new RuntimeException("Test error"), null);
+                    1L, new RuntimeException("Test error"), null);
 
             assertThat(MigrationState.getInstance().getStatus())
                     .isEqualTo(MigrationState.Status.FAILED);
@@ -641,7 +638,7 @@ class MigrationEngineIntegrationTest {
             // Run 3 migrations
             for (int i = 1; i <= 3; i++) {
                 MigrationState.getInstance().migrationStarted(i);
-                MigrationState.getInstance().migrationCompleted(createTestMetrics(i));
+                MigrationState.getInstance().migrationCompleted(i, createTestMetrics(i));
             }
 
             List<MigrationHistoryEntry> history = MigrationState.getInstance().getHistory();
@@ -658,7 +655,7 @@ class MigrationEngineIntegrationTest {
 
             for (int i = 1; i <= 5; i++) {
                 MigrationState.getInstance().migrationStarted(i);
-                MigrationState.getInstance().migrationCompleted(createTestMetrics(i));
+                MigrationState.getInstance().migrationCompleted(i, createTestMetrics(i));
             }
 
             List<MigrationHistoryEntry> history = MigrationState.getInstance().getHistory();
@@ -687,7 +684,7 @@ class MigrationEngineIntegrationTest {
         void shouldClearPhaseOnCompletion() {
             MigrationState.getInstance().migrationStarted(1L);
             MigrationState.getInstance().setCurrentPhase(MigrationMetrics.Phase.SMOKE_TEST);
-            MigrationState.getInstance().migrationCompleted(createTestMetrics(1L));
+            MigrationState.getInstance().migrationCompleted(1L, createTestMetrics(1L));
 
             assertThat(MigrationState.getInstance().getCurrentPhase()).isNull();
         }

@@ -10,6 +10,9 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+/**
+ * Unit tests for {@link SmokeTestReport}.
+ */
 @DisplayName("SmokeTestReport")
 class SmokeTestReportTest {
 
@@ -132,6 +135,42 @@ class SmokeTestReportTest {
             SmokeTestReport report = new SmokeTestReport(false, results);
 
             assertThat(report.success()).isFalse();
+        }
+    }
+
+    @Nested
+    @DisplayName("of (derived success)")
+    class DerivedSuccess {
+
+        @Test
+        @DisplayName("of should be successful when every result is ok")
+        void ofSuccessfulWhenAllOk() {
+            SmokeTestReport report = SmokeTestReport.of(List.of(
+                    SmokeTestResult.ok("a"),
+                    SmokeTestResult.ok("b")
+            ));
+
+            assertThat(report.success()).isTrue();
+        }
+
+        @Test
+        @DisplayName("of should fail when any result failed")
+        void ofFailsWhenAnyFailed() {
+            SmokeTestReport report = SmokeTestReport.of(List.of(
+                    SmokeTestResult.ok("a"),
+                    SmokeTestResult.fail("b", "nope", null)
+            ));
+
+            assertThat(report.success()).isFalse();
+        }
+
+        @Test
+        @DisplayName("of should be successful for an empty result list")
+        void ofSuccessfulWhenEmpty() {
+            SmokeTestReport report = SmokeTestReport.of(List.of());
+
+            assertThat(report.success()).isTrue();
+            assertThat(report.results()).isEmpty();
         }
     }
 

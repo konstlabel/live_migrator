@@ -17,6 +17,8 @@ import java.time.Duration;
  */
 public class MigrationTimeoutException extends RuntimeException {
 
+    private static final long serialVersionUID = 1L;
+
     private final String operation;
     private final Duration timeout;
 

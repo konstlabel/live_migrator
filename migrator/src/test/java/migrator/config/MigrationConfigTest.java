@@ -6,14 +6,17 @@ import java.time.Duration;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+/**
+ * Unit tests for {@link MigrationConfig}.
+ */
 class MigrationConfigTest {
 
     @Test
     void defaults() {
         MigrationConfig c = MigrationConfig.DEFAULTS;
 
-        assertEquals(HeapWalkMode.FULL, c.heapWalkMode());
-        assertTrue(c.isFullHeapWalk());
+        assertEquals(HeapWalkMode.SPEC, c.heapWalkMode());
+        assertFalse(c.isFullHeapWalk());
         assertEquals(Duration.ZERO, c.heapWalkTimeout());
         assertEquals(0, c.minHeapSizeMb());
         assertEquals(0, c.maxHeapSizeMb());

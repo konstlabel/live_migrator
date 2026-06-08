@@ -49,6 +49,7 @@ public final class AnnotationScanner {
      *
      * @return the scan result containing all discovered annotated classes
      * @throws AnnotationNotFoundException if required annotations are not found
+     * @throws IllegalStateException if more than one class is annotated with a single-instance annotation
      */
     public static AnnotationScanResult scan() {
         return scan((ClassLoader) null);
@@ -60,6 +61,7 @@ public final class AnnotationScanner {
      * @param classLoader the classloader to scan, or null for default
      * @return the scan result containing all discovered annotated classes
      * @throws AnnotationNotFoundException if required annotations are not found
+     * @throws IllegalStateException if more than one class is annotated with a single-instance annotation
      */
     public static AnnotationScanResult scan(ClassLoader classLoader) {
         return scan(classLoader, (URL) null);
@@ -72,13 +74,18 @@ public final class AnnotationScanner {
      * @param jarPath path to an additional JAR file to scan, or null to skip
      * @return the scan result containing all discovered annotated classes
      * @throws AnnotationNotFoundException if required annotations are not found
-     * @throws RuntimeException if the JAR path is malformed
+     * @throws IllegalStateException if more than one class is annotated with a single-instance annotation
+     * @throws RuntimeException if the JAR path is invalid or does not exist
      */
     public static AnnotationScanResult scan(ClassLoader classLoader, String jarPath) {
         URL jarUrl = null;
         if (jarPath != null) {
+            File jarFile = new File(jarPath);
+            if (!jarFile.exists()) {
+                throw new RuntimeException("JAR path does not exist: " + jarPath);
+            }
             try {
-                jarUrl = new File(jarPath).toURI().toURL();
+                jarUrl = jarFile.toURI().toURL();
             } catch (MalformedURLException e) {
                 throw new RuntimeException("Invalid JAR path: " + jarPath, e);
             }
@@ -93,6 +100,7 @@ public final class AnnotationScanner {
      * @param additionalUrl URL of an additional location to scan, or null to skip
      * @return the scan result containing all discovered annotated classes
      * @throws AnnotationNotFoundException if required annotations are not found
+     * @throws IllegalStateException if more than one class is annotated with a single-instance annotation
      */
     public static AnnotationScanResult scan(ClassLoader classLoader, URL additionalUrl) {
         ConfigurationBuilder config = new ConfigurationBuilder()
@@ -135,6 +143,12 @@ public final class AnnotationScanner {
         );
     }
 
+    /**
+     * Returns the one class annotated with the given annotation.
+     *
+     * @throws AnnotationNotFoundException if no class carries the annotation
+     * @throws IllegalStateException if more than one does
+     */
     private static Class<?> single(
             Reflections reflections,
             Class<? extends Annotation> annotation

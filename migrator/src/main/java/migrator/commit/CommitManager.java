@@ -6,6 +6,7 @@ import migrator.crac.CracController;
 import migrator.exceptions.MigrateException;
 
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Manages the commit phase of migration by deleting checkpoints
@@ -26,6 +27,7 @@ public class CommitManager {
 
     private final CracController cracController;
     private final CommitListener listener;
+    private final AtomicBoolean committed = new AtomicBoolean(false);
 
     /**
      * Listener for post-commit notifications.
@@ -47,10 +49,23 @@ public class CommitManager {
      * Commit the migration by deleting the checkpoint.
      * After this, rollback is no longer possible.
      *
+     * <p>Idempotent: a repeat call after a successful commit is a no-op. If checkpoint
+     * deletion fails, the commit is not marked done, so a retry is allowed.
+     *
      * @throws MigrateException if checkpoint deletion fails
      */
     public void commit() throws MigrateException {
-        cracController.deleteCheckpoint();
+        if (!committed.compareAndSet(false, true)) {
+            log.debug("commit() already performed; ignoring repeat call");
+            return;
+        }
+        boolean deleted = false;
+        try {
+            cracController.deleteCheckpoint();
+            deleted = true;
+        } finally {
+            if (!deleted) committed.set(false);
+        }
         if (listener != null) {
             try {
                 listener.onCommit();

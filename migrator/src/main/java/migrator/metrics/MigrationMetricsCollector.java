@@ -73,6 +73,13 @@ public final class MigrationMetricsCollector {
         return this;
     }
 
+    /** @throws IllegalStateException if {@link #start(long)} has not been called yet. */
+    private void requireStarted() {
+        if (builder == null) {
+            throw new IllegalStateException("start() must be called before collecting metrics");
+        }
+    }
+
     @FunctionalInterface
     public interface ThrowingRunnable<E extends Exception> {
         void run() throws E;
@@ -87,6 +94,7 @@ public final class MigrationMetricsCollector {
      * Time a phase and run the action (can throw checked exceptions).
      */
     public <E extends Exception> void timed(Phase phase, ThrowingRunnable<E> action) throws E {
+        requireStarted();
         long start = System.nanoTime();
         try {
             action.run();
@@ -100,6 +108,7 @@ public final class MigrationMetricsCollector {
      * Time a phase and return the result (can throw checked exceptions).
      */
     public <T, E extends Exception> T timed(Phase phase, ThrowingSupplier<T, E> action) throws E {
+        requireStarted();
         long start = System.nanoTime();
         try {
             return action.get();
@@ -116,6 +125,7 @@ public final class MigrationMetricsCollector {
      * @return this collector for method chaining
      */
     public MigrationMetricsCollector objectsMigrated(int count) {
+        requireStarted();
         builder.objectsMigrated(count);
         return this;
     }
@@ -127,6 +137,7 @@ public final class MigrationMetricsCollector {
      * @return this collector for method chaining
      */
     public MigrationMetricsCollector objectsPatched(int count) {
+        requireStarted();
         builder.objectsPatched(count);
         return this;
     }
@@ -138,6 +149,7 @@ public final class MigrationMetricsCollector {
      * @return this collector for method chaining
      */
     public MigrationMetricsCollector migratorCount(int count) {
+        requireStarted();
         builder.migratorCount(count);
         return this;
     }
@@ -148,6 +160,7 @@ public final class MigrationMetricsCollector {
      * @return the collected migration metrics
      */
     public MigrationMetrics finish() {
+        requireStarted();
         Instant endTime = Instant.now();
         MemoryUsage heap = memoryBean.getHeapMemoryUsage();
         double cpuLoadAfter = getCpuLoad();
@@ -163,6 +176,7 @@ public final class MigrationMetricsCollector {
                 .build();
     }
 
+    /** Samples current CPU load and raises the running peak if it is higher. */
     private void sampleCpu() {
         double current = getCpuLoad();
         if (current > cpuLoadPeak) {
@@ -170,6 +184,10 @@ public final class MigrationMetricsCollector {
         }
     }
 
+    /**
+     * Returns current CPU load in [0.0, 1.0], preferring the JVM's process/system CPU load and
+     * falling back to the normalized system load average. Returns -1 when no metric is available.
+     */
     private double getCpuLoad() {
         if (osBean instanceof com.sun.management.OperatingSystemMXBean sunBean) {
             double load = sunBean.getCpuLoad();

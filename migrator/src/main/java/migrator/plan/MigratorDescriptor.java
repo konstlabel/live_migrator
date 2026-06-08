@@ -39,7 +39,7 @@ public final class MigratorDescriptor {
      * <p>The migrator class must:
      * <ul>
      *   <li>Implement {@code ClassMigrator<OldT, NewT>} with concrete type parameters</li>
-     *   <li>Have a public no-arg constructor</li>
+     *   <li>Have a no-arg constructor (any visibility; it is made accessible reflectively)</li>
      *   <li>Have source and target types that share a common interface</li>
      * </ul>
      *
@@ -50,7 +50,12 @@ public final class MigratorDescriptor {
      */
     public MigratorDescriptor(Class<? extends ClassMigrator<?, ?>> migratorClass) {
         try {
-            this.migrator = migratorClass.getDeclaredConstructor().newInstance();
+            // Use the no-arg constructor regardless of visibility (and make it accessible), so a
+            // migrator with a non-public no-arg constructor works — consistent with how
+            // ComponentResolver instantiates every other migration component.
+            var ctor = migratorClass.getDeclaredConstructor();
+            ctor.setAccessible(true);
+            this.migrator = ctor.newInstance();
         } catch (Exception e) {
             throw new IllegalArgumentException(
                 "Cannot instantiate migrator: " + migratorClass.getName(), e
@@ -77,8 +82,13 @@ public final class MigratorDescriptor {
         }
 
         Type[] args = paramType.getActualTypeArguments();
-        this.from = (Class<?>) args[0];
-        this.to = (Class<?>) args[1];
+        if (!(args[0] instanceof Class<?> fromClass) || !(args[1] instanceof Class<?> toClass)) {
+            throw new IllegalArgumentException(
+                "ClassMigrator type parameters must be concrete classes: " + migratorClass.getName()
+            );
+        }
+        this.from = fromClass;
+        this.to = toClass;
         this.commonInterface = inferCommonInterface(from, to);
     }
 
@@ -89,14 +99,32 @@ public final class MigratorDescriptor {
     private static Class<?> inferCommonInterface(Class<?> from, Class<?> to) {
         Set<Class<?>> fromInterfaces = getAllInterfaces(from);
 
+        // Prefer an application interface; fall back to a JDK marker interface (Serializable,
+        // Comparable, ...) only when it is the sole shared interface, so the inferred interface
+        // is the meaningful domain type rather than an incidental marker.
+        Class<?> jdkFallback = null;
         for (Class<?> iface : fromInterfaces) {
             if (iface.isAssignableFrom(to)) {
-                return iface;
+                if (isJdkInterface(iface)) {
+                    if (jdkFallback == null) jdkFallback = iface;
+                } else {
+                    return iface;
+                }
             }
+        }
+        if (jdkFallback != null) {
+            return jdkFallback;
         }
         throw new IllegalArgumentException(
             "Cannot determine common interface between " + from.getName() + " and " + to.getName()
         );
+    }
+
+    /** True for interfaces declared in the {@code java.*}/{@code jdk.*} platform modules (e.g. Serializable). */
+    private static boolean isJdkInterface(Class<?> iface) {
+        Module module = iface.getModule();
+        String name = module != null ? module.getName() : null;
+        return name != null && (name.startsWith("java") || name.startsWith("jdk"));
     }
 
     /**
@@ -109,6 +137,7 @@ public final class MigratorDescriptor {
         return interfaces;
     }
 
+    /** Recursively adds {@code cls}'s interfaces (and their superinterfaces and superclass interfaces) to {@code result}. */
     private static void collectInterfaces(Class<?> cls, Set<Class<?>> result) {
         if (cls == null || cls == Object.class) {
             return;

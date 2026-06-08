@@ -11,33 +11,31 @@ import migrator.exceptions.MigrateException;
  * <p>Implementations of this interface provide mechanisms to:
  * <ul>
  *   <li>Take snapshots of all objects of a given class type</li>
- *   <li>Resolve object references from snapshot tags</li>
  *   <li>Walk the entire heap or a filtered subset</li>
  * </ul>
  *
  * <p>The primary implementation is {@link NativeHeapWalker}, which uses JNI
  * for efficient heap traversal.
  *
+ * <p><strong>Error handling:</strong> native-backed implementations require the native
+ * library to be loaded. If it is missing, calls may fail with an unchecked error (e.g.
+ * {@link UnsatisfiedLinkError}) rather than {@link MigrateException}. {@link #snapshotObjects}
+ * has no checked-exception channel and signals failure only via unchecked exceptions.
+ *
  * @see NativeHeapWalker
- * @see HeapSnapshot
  */
 public interface HeapWalker {
 
     /**
-     * Takes a snapshot of all objects of a given class type on the heap.
+     * Takes a snapshot of all objects of a given class type and returns them directly.
+     *
+     * <p>This is the fast path — it resolves all objects in a single bulk JVMTI call
+     * instead of returning tags that must be resolved individually.
      *
      * @param targetClass the class type to snapshot
-     * @return a snapshot containing entries for all instances of the class
+     * @return array of all live instances (never null, may be empty)
      */
-    HeapSnapshot snapshot(Class<?> targetClass);
-
-    /**
-     * Resolves an object reference from a snapshot tag.
-     *
-     * @param tag the tag from a {@link HeapSnapshot.Entry}
-     * @return the resolved object, or null if the object has been garbage collected
-     */
-    Object resolve(long tag);
+    Object[] snapshotObjects(Class<?> targetClass);
 
     /**
      * Walk the entire heap and return all live objects.

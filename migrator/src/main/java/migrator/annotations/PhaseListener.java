@@ -26,6 +26,7 @@ import java.lang.annotation.*;
  * @see migrator.phase.MigrationPhaseListener
  * @see migrator.scanner.AnnotationScanner
  */
+@Documented
 @Retention(RetentionPolicy.RUNTIME)
 @Target(ElementType.TYPE)
 public @interface PhaseListener {

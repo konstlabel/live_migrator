@@ -19,6 +19,10 @@ import java.util.Objects;
  * <p>Annotate your implementation with {@link migrator.annotations.RollbackComponent}
  * for automatic discovery during classpath scanning.
  *
+ * <p><strong>Note:</strong> rollback is only as capable as the injected
+ * {@link CracController}. Backed by {@link migrator.crac.NoopCracController} (no checkpoint
+ * support), {@link #rollback()} always fails — there is nothing to restore.
+ *
  * @see CommitManager
  * @see CracController
  * @see migrator.annotations.RollbackComponent
@@ -53,7 +57,7 @@ public class RollbackManager {
         } catch (MigrateException me) {
             throw me;
         } catch (Exception e) {
-            throw new MigrateException("Rollback failed: " + e.getMessage(), e);
+            throw new MigrateException("Rollback failed: " + e, e);
         }
     }
 }

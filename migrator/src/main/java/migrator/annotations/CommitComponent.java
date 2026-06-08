@@ -23,6 +23,7 @@ import java.lang.annotation.*;
  * @see migrator.commit.CommitManager
  * @see migrator.scanner.AnnotationScanner
  */
+@Documented
 @Retention(RetentionPolicy.RUNTIME)
 @Target(ElementType.TYPE)
 public @interface CommitComponent {

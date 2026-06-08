@@ -9,6 +9,9 @@ import java.util.concurrent.TimeoutException;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+/**
+ * Unit tests for {@link MigrationTimeoutException}.
+ */
 @DisplayName("MigrationTimeoutException")
 class MigrationTimeoutExceptionTest {
 

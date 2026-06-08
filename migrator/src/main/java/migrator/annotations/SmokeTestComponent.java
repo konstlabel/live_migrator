@@ -26,6 +26,7 @@ import java.lang.annotation.*;
  * @see migrator.smoke.SmokeTest
  * @see migrator.scanner.AnnotationScanner
  */
+@Documented
 @Retention(RetentionPolicy.RUNTIME)
 @Target(ElementType.TYPE)
 public @interface SmokeTestComponent {

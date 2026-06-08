@@ -2,6 +2,7 @@ package migrator.metrics;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Collections;
 import java.util.EnumMap;
 import java.util.LinkedHashMap;
 import java.util.Locale;
@@ -37,6 +38,13 @@ public record MigrationMetrics(
         int objectsPatched,
         int migratorCount
 ) {
+    /** Defensively wraps the mutable phase-duration map so the record stays truly immutable. */
+    public MigrationMetrics {
+        phaseDurations = (phaseDurations == null || phaseDurations.isEmpty())
+                ? Map.of()
+                : Collections.unmodifiableMap(new EnumMap<>(phaseDurations));
+    }
+
     /**
      * Migration execution phases for timing breakdown.
      */
@@ -62,6 +70,7 @@ public record MigrationMetrics(
      * @param nonHeapUsed bytes of non-heap memory in use
      */
     public record MemoryMetrics(long heapUsed, long heapCommitted, long heapMax, long nonHeapUsed) {
+        /** @return a human-readable "used / committed (max …)" heap summary. */
         public String heapSummary() {
             return String.format(Locale.ROOT, "%s / %s (max %s)",
                     formatBytes(heapUsed), formatBytes(heapCommitted), formatBytes(heapMax));
@@ -77,8 +86,10 @@ public record MigrationMetrics(
      * @param processors number of available processors
      */
     public record CpuMetrics(double before, double after, double peak, int processors) {
+        /** @return a human-readable "before% -> after% (peak: …%)" CPU summary. */
         public String summary() {
-            return String.format(Locale.ROOT, "%.1f%% -> %.1f%% (peak: %.1f%%)", before * 100, after * 100, peak * 100);
+            return String.format(Locale.ROOT, "%.1f%% -> %.1f%% (peak: %.1f%%)",
+                    Math.max(0, before) * 100, Math.max(0, after) * 100, Math.max(0, peak) * 100);
         }
     }
 
@@ -130,15 +141,18 @@ public record MigrationMetrics(
     public Map<String, Object> toMap() {
         Map<String, Object> map = new LinkedHashMap<>();
         map.put("migrationId", migrationId);
-        map.put("startTime", startTime.toString());
-        map.put("endTime", endTime.toString());
+        // Null-guard every component: although the engine always supplies fully-populated metrics
+        // via the collector, the canonical/record constructor is public, so a directly-built metric
+        // may have null timestamps or memory/cpu sub-records. Serialize null rather than NPE.
+        map.put("startTime", startTime != null ? startTime.toString() : null);
+        map.put("endTime", endTime != null ? endTime.toString() : null);
         map.put("totalDurationMs", totalDurationMs);
-        map.put("heapUsedBefore", memoryBefore.heapUsed);
-        map.put("heapUsedAfter", memoryAfter.heapUsed);
-        map.put("heapDelta", heapDelta());
-        map.put("cpuLoadBefore", cpu.before);
-        map.put("cpuLoadAfter", cpu.after);
-        map.put("cpuLoadPeak", cpu.peak);
+        map.put("heapUsedBefore", memoryBefore != null ? memoryBefore.heapUsed : null);
+        map.put("heapUsedAfter", memoryAfter != null ? memoryAfter.heapUsed : null);
+        map.put("heapDelta", (memoryBefore != null && memoryAfter != null) ? heapDelta() : null);
+        map.put("cpuLoadBefore", cpu != null ? cpu.before : null);
+        map.put("cpuLoadAfter", cpu != null ? cpu.after : null);
+        map.put("cpuLoadPeak", cpu != null ? cpu.peak : null);
         map.put("objectsMigrated", objectsMigrated);
         map.put("objectsPatched", objectsPatched);
         phaseDurations.forEach((phase, duration) ->
@@ -146,6 +160,7 @@ public record MigrationMetrics(
         return map;
     }
 
+    /** Formats a byte count as B/KB/MB/GB with one or two decimal places. */
     private static String formatBytes(long bytes) {
         if (bytes < 1024) return bytes + "B";
         if (bytes < 1024 * 1024) return String.format(Locale.ROOT, "%.1fKB", bytes / 1024.0);
@@ -165,7 +180,7 @@ public record MigrationMetrics(
     /**
      * Builder for constructing {@link MigrationMetrics} instances.
      */
-    public static class Builder {
+    public static final class Builder {
         private long migrationId;
         private Instant startTime;
         private Instant endTime;

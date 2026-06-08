@@ -8,6 +8,9 @@ import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+/**
+ * Unit tests for {@link ForwardingTable}.
+ */
 @DisplayName("ForwardingTable")
 class ForwardingTableTest {
 

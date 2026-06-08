@@ -11,6 +11,9 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+/**
+ * Unit tests for {@link MigrationPlan}.
+ */
 @DisplayName("MigrationPlan")
 class MigrationPlanTest {
 
@@ -74,6 +77,20 @@ class MigrationPlanTest {
         }
     }
 
+    // ----- fixtures for duplicate-target: two distinct sources migrate to the SAME target -----
+    interface Shared { }
+    static class SrcA implements Shared { }
+    static class SrcB implements Shared { }
+    static class SharedTarget implements Shared { }
+
+    public static class SrcAToTarget implements ClassMigrator<SrcA, SharedTarget> {
+        @Override public SharedTarget migrate(SrcA old) { return new SharedTarget(); }
+    }
+
+    public static class SrcBToTarget implements ClassMigrator<SrcB, SharedTarget> {
+        @Override public SharedTarget migrate(SrcB old) { return new SharedTarget(); }
+    }
+
     @Nested
     @DisplayName("build")
     class Build {
@@ -134,6 +151,28 @@ class MigrationPlanTest {
             assertThatThrownBy(() -> MigrationPlan.build(null))
                     .isInstanceOf(NullPointerException.class);
         }
+
+        @Test
+        @DisplayName("should reject a null descriptor element in the list")
+        void shouldRejectNullDescriptorElement() {
+            List<MigratorDescriptor> withNull = new java.util.ArrayList<>();
+            withNull.add(new MigratorDescriptor(UserMigrator.class));
+            withNull.add(null);
+
+            assertThatThrownBy(() -> MigrationPlan.build(withNull))
+                    .isInstanceOf(NullPointerException.class);
+        }
+
+        @Test
+        @DisplayName("should reject two migrators that target the same class")
+        void shouldRejectDuplicateTargetClass() {
+            MigratorDescriptor a = new MigratorDescriptor(SrcAToTarget.class);
+            MigratorDescriptor b = new MigratorDescriptor(SrcBToTarget.class);
+
+            assertThatThrownBy(() -> MigrationPlan.build(List.of(a, b)))
+                    .isInstanceOf(MigrateException.class)
+                    .hasMessageContaining("Multiple migrators target the same class");
+        }
     }
 
     @Nested
@@ -172,6 +211,24 @@ class MigrationPlanTest {
             public A2 migrate(A1 old) { return new A2(); }
         }
 
+        // Direct 2-cycle: A1 -> B1 and B1 -> A1 (both implement Cyclic).
+        interface Cyclic { }
+        static class CycX implements Cyclic { }
+        static class CycY implements Cyclic { }
+
+        public static class XToYMigrator implements ClassMigrator<CycX, CycY> {
+            @Override public CycY migrate(CycX old) { return new CycY(); }
+        }
+
+        public static class YToXMigrator implements ClassMigrator<CycY, CycX> {
+            @Override public CycX migrate(CycY old) { return new CycX(); }
+        }
+
+        // Self-cycle: a class migrated to itself (X -> X).
+        public static class XToXMigrator implements ClassMigrator<CycX, CycX> {
+            @Override public CycX migrate(CycX old) { return new CycX(); }
+        }
+
         @Test
         @DisplayName("should accept non-cyclic migrations")
         void shouldAcceptNonCyclicMigrations() throws MigrateException {
@@ -181,11 +238,46 @@ class MigrationPlanTest {
 
             assertThat(plan.hasMigration(A1.class)).isTrue();
         }
+
+        @Test
+        @DisplayName("should reject a direct two-node cycle (X -> Y -> X)")
+        void shouldRejectTwoNodeCycle() {
+            MigratorDescriptor xy = new MigratorDescriptor(XToYMigrator.class);
+            MigratorDescriptor yx = new MigratorDescriptor(YToXMigrator.class);
+
+            assertThatThrownBy(() -> MigrationPlan.build(List.of(xy, yx)))
+                    .isInstanceOf(MigrateException.class)
+                    .hasMessageContaining("Migration cycle detected");
+        }
+
+        @Test
+        @DisplayName("should reject a self-cycle (X -> X)")
+        void shouldRejectSelfCycle() {
+            MigratorDescriptor xx = new MigratorDescriptor(XToXMigrator.class);
+
+            assertThatThrownBy(() -> MigrationPlan.build(List.of(xx)))
+                    .isInstanceOf(MigrateException.class)
+                    .hasMessageContaining("Migration cycle detected");
+        }
     }
 
     @Nested
     @DisplayName("topological ordering")
     class TopologicalOrdering {
+
+        // Chain fixtures: CA -> CB -> CC (all share Chain), exercising dependency ordering.
+        interface Chain { }
+        static class CA implements Chain { }
+        static class CB implements Chain { }
+        static class CC implements Chain { }
+
+        public static class AToBMigrator implements ClassMigrator<CA, CB> {
+            @Override public CB migrate(CA old) { return new CB(); }
+        }
+
+        public static class BToCMigrator implements ClassMigrator<CB, CC> {
+            @Override public CC migrate(CB old) { return new CC(); }
+        }
 
         @Test
         @DisplayName("should order independent migrators")
@@ -197,6 +289,19 @@ class MigrationPlanTest {
 
             // Both should be present, order doesn't matter for independent ones
             assertThat(plan.orderedMigrators()).containsExactlyInAnyOrder(userDesc, entityDesc);
+        }
+
+        @Test
+        @DisplayName("orders a dependency chain downstream-first (B->C before A->B)")
+        void shouldOrderChainDependenciesFirst() throws MigrateException {
+            MigratorDescriptor ab = new MigratorDescriptor(AToBMigrator.class);
+            MigratorDescriptor bc = new MigratorDescriptor(BToCMigrator.class);
+
+            // Pass them in the "wrong" order to prove ordering is computed, not preserved.
+            MigrationPlan plan = MigrationPlan.build(List.of(ab, bc));
+
+            // CA -> CB -> CC: the B->C migrator must run before the A->B migrator.
+            assertThat(plan.orderedMigrators()).containsExactly(bc, ab);
         }
     }
 

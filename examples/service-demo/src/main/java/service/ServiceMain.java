@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -56,7 +57,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class ServiceMain {
 
     private static final Logger log = LoggerFactory.getLogger(ServiceMain.class);
-    public static final List<User> users = new ArrayList<>();
+    public static final List<User> users = new CopyOnWriteArrayList<>();
     private static final AtomicInteger idCounter = new AtomicInteger(1);
     private static final long startTimeMs = System.currentTimeMillis();
 
@@ -139,9 +140,13 @@ public class ServiceMain {
         String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
         String name = "User" + idCounter.get();
 
-        // Simple parsing: name=value
-        if (body.contains("name=")) {
-            name = body.split("name=")[1].split("&")[0].trim();
+        // Simple parsing: name=value (tolerate a missing or empty value)
+        int idx = body.indexOf("name=");
+        if (idx >= 0) {
+            String parsed = body.substring(idx + "name=".length()).split("&", 2)[0].trim();
+            if (!parsed.isEmpty()) {
+                name = parsed;
+            }
         }
 
         // Use factory to create user - after migration this will create NewUser

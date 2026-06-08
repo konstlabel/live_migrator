@@ -13,6 +13,9 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 
+/**
+ * Unit tests for {@link NoopPhaseListener}.
+ */
 @DisplayName("NoopPhaseListener")
 class NoopPhaseListenerTest {
 

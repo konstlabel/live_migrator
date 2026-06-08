@@ -9,6 +9,9 @@ import java.time.Duration;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+/**
+ * Unit tests for {@link MigrationTimeoutConfig}.
+ */
 @DisplayName("MigrationTimeoutConfig")
 class MigrationTimeoutConfigTest {
 
@@ -128,6 +131,79 @@ class MigrationTimeoutConfigTest {
                     .build();
 
             assertThat(config.heapWalkTimeout()).isEqualTo(MigrationTimeoutConfig.NO_TIMEOUT);
+        }
+    }
+
+    @Nested
+    @DisplayName("Duration-setter normalization")
+    class DurationNormalization {
+
+        @Test
+        @DisplayName("should normalize a negative Duration to NO_TIMEOUT")
+        void shouldNormalizeNegativeDurationToNoTimeout() {
+            MigrationTimeoutConfig config = MigrationTimeoutConfig.builder()
+                    .heapWalkTimeout(Duration.ofSeconds(-5))
+                    .build();
+
+            assertThat(config.heapWalkTimeout()).isEqualTo(MigrationTimeoutConfig.NO_TIMEOUT);
+            assertThat(config.heapWalkTimeout().isNegative()).isFalse();
+        }
+
+        @Test
+        @DisplayName("should normalize a zero Duration to NO_TIMEOUT")
+        void shouldNormalizeZeroDurationToNoTimeout() {
+            MigrationTimeoutConfig config = MigrationTimeoutConfig.builder()
+                    .criticalPhaseTimeout(Duration.ZERO)
+                    .build();
+
+            assertThat(config.criticalPhaseTimeout()).isEqualTo(MigrationTimeoutConfig.NO_TIMEOUT);
+        }
+
+        @Test
+        @DisplayName("allTimeouts should normalize a negative Duration to NO_TIMEOUT")
+        void allTimeoutsShouldNormalizeNegative() {
+            MigrationTimeoutConfig config = MigrationTimeoutConfig.builder()
+                    .allTimeouts(Duration.ofMillis(-1))
+                    .build();
+
+            assertThat(config.heapWalkTimeout()).isEqualTo(MigrationTimeoutConfig.NO_TIMEOUT);
+            assertThat(config.heapSnapshotTimeout()).isEqualTo(MigrationTimeoutConfig.NO_TIMEOUT);
+            assertThat(config.criticalPhaseTimeout()).isEqualTo(MigrationTimeoutConfig.NO_TIMEOUT);
+            assertThat(config.smokeTestTimeout()).isEqualTo(MigrationTimeoutConfig.NO_TIMEOUT);
+        }
+    }
+
+    @Nested
+    @DisplayName("equals and hashCode")
+    class EqualsHashCode {
+
+        @Test
+        @DisplayName("configs with identical timeouts should be equal")
+        void identicalConfigsAreEqual() {
+            MigrationTimeoutConfig a = MigrationTimeoutConfig.builder().heapWalkTimeoutSeconds(30).build();
+            MigrationTimeoutConfig b = MigrationTimeoutConfig.builder().heapWalkTimeoutSeconds(30).build();
+
+            assertThat(a).isEqualTo(b);
+            assertThat(a).hasSameHashCodeAs(b);
+        }
+
+        @Test
+        @DisplayName("configs with different timeouts should not be equal")
+        void differentConfigsAreNotEqual() {
+            MigrationTimeoutConfig a = MigrationTimeoutConfig.builder().heapWalkTimeoutSeconds(30).build();
+            MigrationTimeoutConfig b = MigrationTimeoutConfig.builder().heapWalkTimeoutSeconds(31).build();
+
+            assertThat(a).isNotEqualTo(b);
+        }
+
+        @Test
+        @DisplayName("a negative-Duration config equals a NO_TIMEOUT config (both normalized)")
+        void normalizedNegativeEqualsDisabled() {
+            MigrationTimeoutConfig negative = MigrationTimeoutConfig.builder()
+                    .heapWalkTimeout(Duration.ofSeconds(-1))
+                    .build();
+
+            assertThat(negative).isEqualTo(MigrationTimeoutConfig.DEFAULTS);
         }
     }
 

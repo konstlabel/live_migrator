@@ -1,7 +1,6 @@
 package migrator.smoke;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -52,15 +51,19 @@ public class SmokeTestRunner {
      * @return a report containing all test results
      */
     public SmokeTestReport runAll(Map<MigratorDescriptor, List<Object>> createdPerMigrator) {
+        // Tolerate a null map: health checks don't need it, and smoke tests get an empty map
+        // rather than NPE'ing on null.
+        Map<MigratorDescriptor, List<Object>> created =
+                createdPerMigrator != null ? createdPerMigrator : Map.of();
+
         List<SmokeTestResult> results = new ArrayList<>();
-
         results.addAll(runHealthChecks());
-        results.addAll(runSmokeTests(createdPerMigrator));
+        results.addAll(runSmokeTests(created));
 
-        boolean success = results.stream().allMatch(SmokeTestResult::isOk);
-        return new SmokeTestReport(success, Collections.unmodifiableList(results));
+        return SmokeTestReport.of(results);
     }
 
+    /** Runs every registered health check, isolating failures into individual results. */
     private List<SmokeTestResult> runHealthChecks() {
         List<SmokeTestResult> results = new ArrayList<>();
         for (int i = 0; i < healthChecks.size(); i++) {
@@ -70,13 +73,15 @@ public class SmokeTestRunner {
                 boolean ok = hc.check();
                 results.add(ok ? SmokeTestResult.ok(name)
                             : SmokeTestResult.fail(name, "returned false", null));
-            } catch (Exception e) {
-                results.add(SmokeTestResult.fail(name, "threw: " + e.getMessage(), e));
+            } catch (Throwable t) {
+                rethrowIfFatal(t);
+                results.add(SmokeTestResult.fail(name, "threw: " + t, t));
             }
         }
         return results;
     }
 
+    /** Runs every registered smoke test, naming unnamed/null results and isolating failures. */
     private List<SmokeTestResult> runSmokeTests(Map<MigratorDescriptor, List<Object>> createdPerMigrator) {
         List<SmokeTestResult> results = new ArrayList<>();
         for (int i = 0; i < smokeTests.size(); i++) {
@@ -91,11 +96,24 @@ public class SmokeTestRunner {
                 } else {
                     results.add(r);
                 }
-            } catch (Exception e) {
-                results.add(SmokeTestResult.fail(name, "threw: " + e.getMessage(), e));
+            } catch (Throwable t) {
+                rethrowIfFatal(t);
+                results.add(SmokeTestResult.fail(name, "threw: " + t, t));
             }
         }
         return results;
+    }
+
+    /**
+     * Catches {@link Throwable} so that a single test's failure — including an
+     * {@link AssertionError} (the natural way to write a smoke-test assertion) or any other
+     * {@link Error} — is recorded as a failed result rather than aborting the whole run.
+     * Truly unrecoverable VM-level failures are rethrown so they are never swallowed.
+     */
+    private static void rethrowIfFatal(Throwable t) {
+        if (t instanceof VirtualMachineError || t instanceof LinkageError) {
+            throw (Error) t;
+        }
     }
 
     /**

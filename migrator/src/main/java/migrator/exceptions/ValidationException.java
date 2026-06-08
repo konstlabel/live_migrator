@@ -19,6 +19,8 @@ package migrator.exceptions;
  */
 public class ValidationException extends Exception {
 
+    private static final long serialVersionUID = 1L;
+
     /** Creates a new validation exception with no message. */
     public ValidationException() { super(); }
 

@@ -102,22 +102,31 @@ public final class MigrationState {
      * @param phase the current phase, or null if between phases
      */
     public void setCurrentPhase(Phase phase) {
-        this.currentPhase = phase;
+        // Under the write lock like every other mutator, so it can't race with the lifecycle
+        // transitions (started/completed/failed/reset) that also clear currentPhase.
+        lock.writeLock().lock();
+        try {
+            this.currentPhase = phase;
+        } finally {
+            lock.writeLock().unlock();
+        }
     }
 
     /**
      * Mark migration as completed successfully.
      *
+     * @param migrationId the id of the migration that completed
      * @param metrics the final migration metrics
      */
-    public void migrationCompleted(MigrationMetrics metrics) {
+    public void migrationCompleted(long migrationId, MigrationMetrics metrics) {
         lock.writeLock().lock();
         try {
             this.status = Status.SUCCESS;
+            this.currentMigrationId = migrationId;
             this.lastMetrics = metrics;
             this.currentPhase = null;
             this.lastError = null;
-            addToHistory(MigrationHistoryEntry.success(currentMigrationId, metrics));
+            addToHistory(MigrationHistoryEntry.success(migrationId, metrics));
         } finally {
             lock.writeLock().unlock();
         }
@@ -126,22 +135,25 @@ public final class MigrationState {
     /**
      * Mark migration as failed.
      *
+     * @param migrationId the id of the migration that failed
      * @param error the error that caused the failure
      * @param partialMetrics partial metrics collected before failure (may be null)
      */
-    public void migrationFailed(Throwable error, MigrationMetrics partialMetrics) {
+    public void migrationFailed(long migrationId, Throwable error, MigrationMetrics partialMetrics) {
         lock.writeLock().lock();
         try {
             this.status = Status.FAILED;
+            this.currentMigrationId = migrationId;
             this.lastError = error != null ? error.getMessage() : "Unknown error";
             this.lastMetrics = partialMetrics;
             this.currentPhase = null;
-            addToHistory(MigrationHistoryEntry.failure(currentMigrationId, lastError, partialMetrics));
+            addToHistory(MigrationHistoryEntry.failure(migrationId, lastError, partialMetrics));
         } finally {
             lock.writeLock().unlock();
         }
     }
 
+    /** Prepends an entry (most-recent-first) and trims the list to {@code maxHistorySize}. Caller holds the write lock. */
     private void addToHistory(MigrationHistoryEntry entry) {
         history.add(0, entry);
         while (history.size() > maxHistorySize) {
@@ -182,6 +194,10 @@ public final class MigrationState {
 
     /**
      * Get the current migration status.
+     *
+     * <p>This and the other single-field getters are lock-free, so reading several of them in
+     * sequence may observe a torn view across a concurrent transition. Use {@link #toMap()} or
+     * {@link #getHistory()} when a consistent snapshot is required.
      */
     public Status getStatus() {
         return status;
@@ -209,7 +225,8 @@ public final class MigrationState {
     }
 
     /**
-     * Get the metrics from the last completed migration.
+     * Get the metrics from the last migration. After a successful run these are the final metrics;
+     * after a failure they are the partial metrics collected before the failure (possibly null).
      */
     public MigrationMetrics getLastMetrics() {
         return lastMetrics;
@@ -251,6 +268,17 @@ public final class MigrationState {
                 map.put("lastMigration", lastMetrics.toMap());
             }
 
+            List<Map<String, Object>> historyList = new ArrayList<>(history.size());
+            for (MigrationHistoryEntry entry : history) {
+                Map<String, Object> entryMap = new LinkedHashMap<>();
+                entryMap.put("migrationId", entry.migrationId());
+                entryMap.put("status", entry.status().name());
+                entryMap.put("timestamp", entry.timestamp() != null ? entry.timestamp().toString() : null);
+                entryMap.put("errorMessage", entry.errorMessage());
+                historyList.add(entryMap);
+            }
+            map.put("history", historyList);
+
             return map;
         } finally {
             lock.readLock().unlock();
@@ -258,7 +286,8 @@ public final class MigrationState {
     }
 
     /**
-     * Reset state to IDLE. Primarily for testing.
+     * Reset state to IDLE, including restoring the default history size. Primarily for testing,
+     * so each test starts from a clean slate.
      */
     public void reset() {
         lock.writeLock().lock();
@@ -269,6 +298,7 @@ public final class MigrationState {
             this.startTime = null;
             this.lastMetrics = null;
             this.lastError = null;
+            this.maxHistorySize = DEFAULT_HISTORY_SIZE;
             this.history.clear();
         } finally {
             lock.writeLock().unlock();

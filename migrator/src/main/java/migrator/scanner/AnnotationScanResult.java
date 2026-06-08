@@ -1,5 +1,6 @@
 package migrator.scanner;
 
+import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -44,11 +45,11 @@ public final class AnnotationScanResult {
             Class<?> rollbackManager,
             Set<Class<?>> smokeTests
     ) {
-        this.migrator = migrator;
-        this.phaseListener = phaseListener;
-        this.commitManager = commitManager;
-        this.rollbackManager = rollbackManager;
-        this.smokeTests = smokeTests;
+        this.migrator = Objects.requireNonNull(migrator, "migrator");
+        this.phaseListener = Objects.requireNonNull(phaseListener, "phaseListener");
+        this.commitManager = Objects.requireNonNull(commitManager, "commitManager");
+        this.rollbackManager = Objects.requireNonNull(rollbackManager, "rollbackManager");
+        this.smokeTests = Set.copyOf(Objects.requireNonNull(smokeTests, "smokeTests"));
     }
 
     /** Returns the class annotated with {@code @Migrator}. */

@@ -8,6 +8,8 @@ import migrator.smoke.SmokeTestRunner;
 import migrator.smoke.SmokeTest;
 
 import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
+import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -35,6 +37,9 @@ public final class ComponentResolver {
      * @throws IllegalStateException if the class does not implement ClassMigrator
      */
     public Class<? extends ClassMigrator<?, ?>> resolveMigrator(Class<?> type) {
+        if (type == null) {
+            throw new IllegalStateException("@Migrator class must not be null");
+        }
         if (!ClassMigrator.class.isAssignableFrom(type)) {
             throw new IllegalStateException(
                     "@Migrator must implement ClassMigrator<?, ?>: " + type.getName()
@@ -65,10 +70,11 @@ public final class ComponentResolver {
      * @throws IllegalStateException if any class cannot be instantiated
      */
     public SmokeTestRunner resolveSmokeTestRunner(Set<Class<?>> smokeTestClasses) {
+        Objects.requireNonNull(smokeTestClasses, "smokeTestClasses");
         SmokeTestRunner.Builder builder = new SmokeTestRunner.Builder();
 
         for (Class<?> testClass : smokeTestClasses) {
-            SmokeTest test = instantiateSmokeTest(testClass);
+            SmokeTest test = instantiate(testClass, SmokeTest.class, "@SmokeTestComponent");
             builder.addSmokeTest(test);
         }
 
@@ -83,7 +89,7 @@ public final class ComponentResolver {
      * @throws IllegalStateException if instantiation fails or class is invalid
      */
     public CommitManager resolveCommitManager(Class<?> type) {
-        return instantiate(type, CommitManager.class, "@CommitManager");
+        return instantiate(type, CommitManager.class, "@CommitComponent");
     }
 
     /**
@@ -94,14 +100,23 @@ public final class ComponentResolver {
      * @throws IllegalStateException if instantiation fails or class is invalid
      */
     public RollbackManager resolveRollbackManager(Class<?> type) {
-        return instantiate(type, RollbackManager.class, "@RollbackManager");
+        return instantiate(type, RollbackManager.class, "@RollbackComponent");
     }
 
+    /**
+     * Validates that {@code type} implements {@code expectedInterface} and instantiates it via its
+     * (possibly non-public) no-arg constructor.
+     *
+     * @throws IllegalStateException if the type is incompatible or has no no-arg constructor
+     */
     private <T> T instantiate(
             Class<?> type,
             Class<T> expectedInterface,
             String annotationName
     ) {
+        if (type == null) {
+            throw new IllegalStateException(annotationName + " class must not be null");
+        }
         if (!expectedInterface.isAssignableFrom(type)) {
             throw new IllegalStateException(
                     annotationName + " must implement " + expectedInterface.getSimpleName()
@@ -117,28 +132,19 @@ public final class ComponentResolver {
             throw new IllegalStateException(
                     type.getName() + " must have a no-arg constructor", e
             );
-        } catch (Exception e) {
-            throw new RuntimeException(
-                    "Failed to instantiate " + type.getName(), e
-            );
-        }
-    }
-
-    private SmokeTest instantiateSmokeTest(Class<?> type) {
-        if (!SmokeTest.class.isAssignableFrom(type)) {
+        } catch (InvocationTargetException e) {
+            // The component's own constructor threw; surface its cause rather than burying it.
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
             throw new IllegalStateException(
-                    "@SmokeTestComponent must implement SmokeTest: " + type.getName()
+                    "Failed to instantiate " + type.getName() + ": " + cause, cause
             );
-        }
-
-        try {
-            Constructor<?> ctor = type.getDeclaredConstructor();
-            ctor.setAccessible(true);
-            return (SmokeTest) ctor.newInstance();
         } catch (Exception e) {
-            throw new RuntimeException(
-                    "Failed to instantiate SmokeTest: " + type.getName(), e
+            // ReflectiveOperationException (abstract class, inaccessible ctor, etc.) — the
+            // resolvers document IllegalStateException for instantiation failures.
+            throw new IllegalStateException(
+                    "Failed to instantiate " + type.getName() + ": " + e, e
             );
         }
     }
+
 }

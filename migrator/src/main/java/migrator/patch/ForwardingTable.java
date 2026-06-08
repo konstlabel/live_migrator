@@ -1,57 +1,33 @@
 package migrator.patch;
 
-import java.lang.ref.ReferenceQueue;
-import java.lang.ref.WeakReference;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.IdentityHashMap;
 
 /**
- * Maps old objects to their migrated counterparts using identity-based weak references.
+ * Maps old objects to their migrated counterparts using identity-based comparison.
  *
  * <p>This table is used during migration to track which old objects have been
- * migrated and what their new counterparts are. Uses weak references to allow
- * garbage collection of old objects.
+ * migrated and what their new counterparts are.
  *
  * <p>Key features:
  * <ul>
  *   <li>Identity-based comparison (not equals/hashCode)</li>
- *   <li>Weak references allow GC of old objects</li>
- *   <li>Automatic cleanup of stale entries</li>
+ *   <li>Fast O(1) lookups via a single {@link IdentityHashMap} (no per-lookup allocation)</li>
  * </ul>
+ *
+ * <p>The table is created fresh per migration and lives only for the duration of that
+ * migration; the old objects it maps are kept strongly reachable by the engine while it
+ * runs, so weak references / GC bookkeeping would add allocation cost without benefit.
+ *
+ * <p><b>Not thread-safe.</b> The contract is that all {@link #put} calls happen during the
+ * migrate pass and complete-before the patch pass begins, after which the table is only read.
+ * If reference patching is ever parallelized, this map must be made concurrent (or safely
+ * published) accordingly.
  *
  * @see ReferencePatcher
  */
 public final class ForwardingTable {
 
-    private static final class IdentityWeakRef extends WeakReference<Object> {
-        private final int hash;
-
-        IdentityWeakRef(Object referent, ReferenceQueue<Object> q) {
-            super(referent, q);
-            this.hash = System.identityHashCode(referent);
-        }
-
-        @Override
-        public int hashCode() {
-            return hash;
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (this == o) return true;
-            if (!(o instanceof IdentityWeakRef other)) return false;
-            Object a = this.get();
-            Object b = other.get();
-            // If either referent has been GC'd, they should not match
-            if (a == null || b == null) {
-                return false;
-            }
-            return a == b;
-        }
-    }
-
-    private final ReferenceQueue<Object> queue = new ReferenceQueue<>();
-    private final Map<IdentityWeakRef, Object> map = new HashMap<>();
+    private final IdentityHashMap<Object, Object> map = new IdentityHashMap<>();
 
     /**
      * Register a mapping from old object to new object.
@@ -60,8 +36,7 @@ public final class ForwardingTable {
      * @param newObj the migrated object
      */
     public void put(Object oldObj, Object newObj) {
-        cleanup();
-        map.put(new IdentityWeakRef(oldObj, queue), newObj);
+        map.put(oldObj, newObj);
     }
 
     /**
@@ -71,8 +46,7 @@ public final class ForwardingTable {
      * @return the migrated object, or null if not found
      */
     public Object get(Object oldObj) {
-        cleanup();
-        return map.get(new IdentityWeakRef(oldObj, null));
+        return map.get(oldObj);
     }
 
     /**
@@ -82,8 +56,7 @@ public final class ForwardingTable {
      * @return true if a mapping exists
      */
     public boolean contains(Object oldObj) {
-        cleanup();
-        return map.containsKey(new IdentityWeakRef(oldObj, null));
+        return map.containsKey(oldObj);
     }
 
     /**
@@ -92,19 +65,11 @@ public final class ForwardingTable {
      * @param oldObj the original object
      */
     public void remove(Object oldObj) {
-        cleanup();
-        map.remove(new IdentityWeakRef(oldObj, null));
+        map.remove(oldObj);
     }
 
     /** Clear all mappings. */
     public void clear() {
         map.clear();
-    }
-
-    private void cleanup() {
-        IdentityWeakRef ref;
-        while ((ref = (IdentityWeakRef) queue.poll()) != null) {
-            map.remove(ref);
-        }
     }
 }

@@ -13,8 +13,8 @@ package migrator.exceptions;
  * </ul>
  *
  * <p>This exception is thrown when the {@link migrator.scanner.AnnotationScanner} cannot
- * locate a required annotated class, or when multiple classes are found for a
- * single-instance annotation.
+ * locate a required annotated class. (When <em>multiple</em> classes are found for a
+ * single-instance annotation, the scanner throws {@link IllegalStateException} instead.)
  *
  * <p>This is an unchecked exception because missing annotations indicate a
  * configuration/deployment problem that cannot be recovered at runtime.
@@ -23,6 +23,8 @@ package migrator.exceptions;
  */
 public class AnnotationNotFoundException extends RuntimeException {
 
+    private static final long serialVersionUID = 1L;
+
     /**
      * Creates a new exception with the specified message.
      *
@@ -30,5 +32,15 @@ public class AnnotationNotFoundException extends RuntimeException {
      */
     public AnnotationNotFoundException(String message) {
         super(message);
+    }
+
+    /**
+     * Creates a new exception with the specified message and cause.
+     *
+     * @param message description of which annotation was not found or had multiple matches
+     * @param cause the underlying cause (e.g. a classpath scanning failure)
+     */
+    public AnnotationNotFoundException(String message, Throwable cause) {
+        super(message, cause);
     }
 }

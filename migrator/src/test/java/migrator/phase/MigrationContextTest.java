@@ -11,7 +11,11 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+/**
+ * Unit tests for {@link MigrationContext}.
+ */
 @DisplayName("MigrationContext")
 class MigrationContextTest {
 
@@ -60,11 +64,10 @@ class MigrationContextTest {
         }
 
         @Test
-        @DisplayName("should accept null plan")
-        void shouldAcceptNullPlan() {
-            MigrationContext context = new MigrationContext(null, 1L);
-
-            assertThat(context.plan()).isNull();
+        @DisplayName("should reject null plan")
+        void shouldRejectNullPlan() {
+            assertThatThrownBy(() -> new MigrationContext(null, 1L))
+                    .isInstanceOf(NullPointerException.class);
         }
 
         @Test
@@ -119,6 +122,29 @@ class MigrationContextTest {
 
             // Technically they could be equal if the JVM is fast enough, but very unlikely
             assertThat(second.startedAtNanos()).isGreaterThanOrEqualTo(first.startedAtNanos());
+        }
+
+        @Test
+        @DisplayName("elapsedNanos should be non-negative and grow over time")
+        void elapsedNanosShouldGrow() throws MigrateException, InterruptedException {
+            MigratorDescriptor descriptor = new MigratorDescriptor(TestMigrator.class);
+            MigrationPlan plan = MigrationPlan.build(List.of(descriptor));
+            MigrationContext context = new MigrationContext(plan, 1L);
+
+            long first = context.elapsedNanos();
+            assertThat(first).isGreaterThanOrEqualTo(0L);
+            Thread.sleep(1);
+            assertThat(context.elapsedNanos()).isGreaterThanOrEqualTo(first);
+        }
+
+        @Test
+        @DisplayName("toString should include the migration id")
+        void toStringShouldIncludeMigrationId() throws MigrateException {
+            MigratorDescriptor descriptor = new MigratorDescriptor(TestMigrator.class);
+            MigrationPlan plan = MigrationPlan.build(List.of(descriptor));
+            MigrationContext context = new MigrationContext(plan, 7L);
+
+            assertThat(context.toString()).contains("migrationId=7");
         }
     }
 

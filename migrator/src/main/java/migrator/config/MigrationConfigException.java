@@ -19,6 +19,8 @@ package migrator.config;
  */
 public class MigrationConfigException extends RuntimeException {
 
+    private static final long serialVersionUID = 1L;
+
     /**
      * Creates a new configuration exception with the specified message.
      *

@@ -15,7 +15,7 @@ import migrator.exceptions.MigrateException;
  * and locate objects of specific types. It supports:
  * <ul>
  *   <li>Taking snapshots of objects by class type</li>
- *   <li>Resolving object references from snapshot tags</li>
+ *   <li>Bulk resolution of all matched objects in a single native call</li>
  *   <li>Full heap walks returning all live objects</li>
  *   <li>Filtered heap walks for specific classes only</li>
  *   <li>Epoch advancement for tracking migration generations</li>
@@ -24,25 +24,18 @@ import migrator.exceptions.MigrateException;
  * <p><strong>Note:</strong> Requires the native migrator library to be loaded.
  *
  * @see HeapWalker
- * @see HeapSnapshot
  */
 public final class NativeHeapWalker implements HeapWalker {
 
-    private static native byte[] nativeSnapshotBytes(String internalName);
-    private static native Object nativeResolve(long tag);
+    private static native Object[] nativeSnapshotObjects(Class<?> targetClass);
     private native Object[] nativeWalkHeap();
-    private native Object[] nativeWalkHeapFiltered(String[] internalClassNames);
+    private native Object[] nativeWalkHeapFiltered(Class<?>[] targetClasses);
     private static native void nativeAdvanceEpoch();
 
     @Override
-    public HeapSnapshot snapshot(Class<?> targetClass) {
-        String name = targetClass.getName().replace('.', '/');
-        return HeapSnapshot.fromBytes(nativeSnapshotBytes(name));
-    }
-
-    @Override
-    public Object resolve(long tag) {
-        return nativeResolve(tag);
+    public Object[] snapshotObjects(Class<?> targetClass) {
+        Object[] result = nativeSnapshotObjects(targetClass);
+        return result != null ? result : new Object[0];
     }
 
     @Override
@@ -58,12 +51,11 @@ public final class NativeHeapWalker implements HeapWalker {
     @Override
     public Set<Object> walkHeap(Collection<Class<?>> classes) throws MigrateException {
         if (classes == null || classes.isEmpty()) return Collections.emptySet();
-        String[] names = classes.stream()
+        Class<?>[] targets = classes.stream()
                                 .filter(Objects::nonNull)
-                                .map(c -> c.getName().replace('.', '/'))
                                 .distinct()
-                                .toArray(String[]::new);
-        Object[] objs = nativeWalkHeapFiltered(names);
+                                .toArray(Class<?>[]::new);
+        Object[] objs = nativeWalkHeapFiltered(targets);
         Set<Object> set = Collections.newSetFromMap(new IdentityHashMap<>());
         if (objs != null) Collections.addAll(set, objs);
         return set;

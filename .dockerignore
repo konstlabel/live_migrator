@@ -13,7 +13,6 @@
 .gitignore
 
 # Local files
-.claude/
 *.dump
 *.log
 

@@ -111,6 +111,7 @@ public final class MigrationPlan {
         Map<Class<?>, Class<?>> sourceByTarget = new HashMap<>();
 
         for (MigratorDescriptor d : descriptors) {
+            Objects.requireNonNull(d, "descriptor");
             Class<?> from = d.from();
             Class<?> to = d.to();
 
@@ -145,6 +146,7 @@ public final class MigrationPlan {
 
     // ===== validation =====
 
+    /** Verifies that both the source and target classes implement the inferred common interface. */
     private static void validateCompatibility(
             Class<?> from,
             Class<?> to,
@@ -166,6 +168,7 @@ public final class MigrationPlan {
         }
     }
 
+    /** Throws if the source&rarr;target edges form a cycle (e.g. A&rarr;B&rarr;A). */
     private static void detectCycles(Map<Class<?>, Class<?>> edges)
             throws MigrateException {
 
@@ -181,6 +184,7 @@ public final class MigrationPlan {
         }
     }
 
+    /** Depth-first helper for {@link #detectCycles}; returns true if {@code node} lies on a cycle. */
     private static boolean dfsCycle(
             Class<?> node,
             Map<Class<?>, Class<?>> edges,
@@ -220,6 +224,7 @@ public final class MigrationPlan {
         return result;
     }
 
+    /** Post-order DFS helper for {@link #topologicalOrder}: appends a node after its target. */
     private static void topoDfs(
             Class<?> node,
             Map<Class<?>, MigratorDescriptor> bySource,

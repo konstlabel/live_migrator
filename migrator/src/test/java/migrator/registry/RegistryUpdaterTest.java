@@ -12,6 +12,9 @@ import java.util.*;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+/**
+ * Unit tests for {@link RegistryUpdater}.
+ */
 @DisplayName("RegistryUpdater")
 class RegistryUpdaterTest {
 
@@ -62,9 +65,14 @@ class RegistryUpdaterTest {
             static Map<Object, Object> registry = new HashMap<>();
         }
 
+        static class ConcurrentMapRegistry {
+            @UpdateRegistry(replaceKeys = true, replaceValues = true)
+            static Map<Object, Object> registry = new java.util.concurrent.ConcurrentHashMap<>();
+        }
+
         @Test
-        @DisplayName("should handle map registry without throwing")
-        void shouldHandleMapRegistryWithoutThrowing() {
+        @DisplayName("should replace migrated map value with the new instance")
+        void shouldReplaceMapValue() {
             OldUser old = new OldUser(1);
             NewUser replacement = new NewUser(1);
             forwarding.put(old, replacement);
@@ -72,16 +80,15 @@ class RegistryUpdaterTest {
             MapRegistry.registry.clear();
             MapRegistry.registry.put("user", old);
 
-            // Should not throw
             updater.updateAnnotatedRegistries(List.of(MapRegistry.class), List.of());
 
-            // Map should still exist
-            assertThat(MapRegistry.registry).isNotNull();
+            // The real registry must now point at the migrated instance.
+            assertThat(MapRegistry.registry.get("user")).isSameAs(replacement);
         }
 
         @Test
-        @DisplayName("should handle map with key replacements without throwing")
-        void shouldHandleMapWithKeyReplacementsWithoutThrowing() {
+        @DisplayName("should replace migrated map key with the new instance")
+        void shouldReplaceMapKey() {
             OldUser oldKey = new OldUser(1);
             NewUser newKey = new NewUser(1);
             forwarding.put(oldKey, newKey);
@@ -89,10 +96,43 @@ class RegistryUpdaterTest {
             MapRegistry.registry.clear();
             MapRegistry.registry.put(oldKey, "value");
 
-            // Should not throw
             updater.updateAnnotatedRegistries(List.of(MapRegistry.class), List.of());
 
-            assertThat(MapRegistry.registry).isNotNull();
+            assertThat(MapRegistry.registry).containsKey(newKey);
+            assertThat(MapRegistry.registry).doesNotContainKey(oldKey);
+            assertThat(MapRegistry.registry.get(newKey)).isEqualTo("value");
+        }
+
+        @Test
+        @DisplayName("should replace value in a ConcurrentHashMap registry")
+        void shouldReplaceConcurrentMapValue() {
+            OldUser old = new OldUser(7);
+            NewUser replacement = new NewUser(7);
+            forwarding.put(old, replacement);
+
+            ConcurrentMapRegistry.registry.clear();
+            ConcurrentMapRegistry.registry.put("user", old);
+
+            updater.updateAnnotatedRegistries(List.of(ConcurrentMapRegistry.class), List.of());
+
+            assertThat(ConcurrentMapRegistry.registry.get("user")).isSameAs(replacement);
+        }
+
+        @Test
+        @DisplayName("should leave unmigrated entries untouched")
+        void shouldLeaveUnmigratedEntriesUntouched() {
+            OldUser old = new OldUser(1);
+            NewUser replacement = new NewUser(1);
+            forwarding.put(old, replacement);
+
+            MapRegistry.registry.clear();
+            MapRegistry.registry.put("migrated", old);
+            MapRegistry.registry.put("kept", "plain");
+
+            updater.updateAnnotatedRegistries(List.of(MapRegistry.class), List.of());
+
+            assertThat(MapRegistry.registry.get("migrated")).isSameAs(replacement);
+            assertThat(MapRegistry.registry.get("kept")).isEqualTo("plain");
         }
 
         @Test
@@ -122,8 +162,8 @@ class RegistryUpdaterTest {
         }
 
         @Test
-        @DisplayName("should handle list registry without throwing")
-        void shouldHandleListRegistryWithoutThrowing() {
+        @DisplayName("should replace migrated list element in place")
+        void shouldReplaceListElement() {
             OldUser old = new OldUser(1);
             NewUser replacement = new NewUser(1);
             forwarding.put(old, replacement);
@@ -132,15 +172,16 @@ class RegistryUpdaterTest {
             ListRegistry.registry.add(old);
             ListRegistry.registry.add("keep");
 
-            // Should not throw
             updater.updateAnnotatedRegistries(List.of(ListRegistry.class), List.of());
 
-            assertThat(ListRegistry.registry).contains("keep");
+            // Element 0 must be the migrated instance; order and other elements preserved.
+            assertThat(ListRegistry.registry).containsExactly(replacement, "keep");
+            assertThat(ListRegistry.registry.get(0)).isSameAs(replacement);
         }
 
         @Test
-        @DisplayName("should handle set registry without throwing")
-        void shouldHandleSetRegistryWithoutThrowing() {
+        @DisplayName("should replace migrated set element in place")
+        void shouldReplaceSetElement() {
             OldUser old = new OldUser(1);
             NewUser replacement = new NewUser(1);
             forwarding.put(old, replacement);
@@ -149,10 +190,10 @@ class RegistryUpdaterTest {
             SetRegistry.registry.add(old);
             SetRegistry.registry.add("keep");
 
-            // Should not throw
             updater.updateAnnotatedRegistries(List.of(SetRegistry.class), List.of());
 
-            assertThat(SetRegistry.registry).contains("keep");
+            assertThat(SetRegistry.registry).contains(replacement, "keep");
+            assertThat(SetRegistry.registry).doesNotContain(old);
         }
     }
 
@@ -194,8 +235,8 @@ class RegistryUpdaterTest {
         }
 
         @Test
-        @DisplayName("should handle instance registry fields without throwing")
-        void shouldHandleInstanceRegistryFieldsWithoutThrowing() {
+        @DisplayName("should replace value in an instance map registry")
+        void shouldReplaceInstanceRegistryValue() {
             OldUser old = new OldUser(1);
             NewUser replacement = new NewUser(1);
             forwarding.put(old, replacement);
@@ -203,15 +244,14 @@ class RegistryUpdaterTest {
             InstanceHolder holder = new InstanceHolder();
             holder.instanceRegistry.put("user", old);
 
-            // Should not throw
             updater.updateAnnotatedRegistries(List.of(InstanceHolder.class), List.of(holder));
 
-            assertThat(holder.instanceRegistry).isNotNull();
+            assertThat(holder.instanceRegistry.get("user")).isSameAs(replacement);
         }
 
         @Test
-        @DisplayName("should handle multiple instance holders without throwing")
-        void shouldHandleMultipleInstanceHoldersWithoutThrowing() {
+        @DisplayName("should replace values across multiple instance holders")
+        void shouldReplaceAcrossMultipleInstanceHolders() {
             OldUser old1 = new OldUser(1);
             OldUser old2 = new OldUser(2);
             NewUser new1 = new NewUser(1);
@@ -225,14 +265,13 @@ class RegistryUpdaterTest {
             InstanceHolder holder2 = new InstanceHolder();
             holder2.instanceRegistry.put("user", old2);
 
-            // Should not throw
             updater.updateAnnotatedRegistries(
                     List.of(InstanceHolder.class),
                     List.of(holder1, holder2)
             );
 
-            assertThat(holder1.instanceRegistry).isNotNull();
-            assertThat(holder2.instanceRegistry).isNotNull();
+            assertThat(holder1.instanceRegistry.get("user")).isSameAs(new1);
+            assertThat(holder2.instanceRegistry.get("user")).isSameAs(new2);
         }
     }
 
@@ -345,11 +384,12 @@ class RegistryUpdaterTest {
 
             CallbackRegistry.items.put("user", old);
 
-            // Should not throw
             updater.updateAnnotatedRegistries(List.of(CallbackRegistry.class), List.of());
 
-            // The items map should still exist
-            assertThat(CallbackRegistry.items).isNotNull();
+            // The map value is replaced. Note: onRegistryUpdated() fires only when the
+            // registry VALUE implements RegistryAware (a custom registry object), not when
+            // the declaring class does — here the field is a plain Map, so no callback.
+            assertThat(CallbackRegistry.items.get("user")).isSameAs(replacement);
         }
     }
 }

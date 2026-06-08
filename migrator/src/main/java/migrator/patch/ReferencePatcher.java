@@ -34,6 +34,22 @@ public interface ReferencePatcher {
     void patchObject(Object obj);
 
     /**
+     * Patch all references within a batch of object graphs.
+     *
+     * <p>Equivalent to calling {@link #patchObject(Object)} on each element. Implementations may,
+     * but are not required to, share cycle-detection state across the batch; the default
+     * implementation uses independent per-root state.
+     *
+     * @param objects the root objects to patch (null is safely ignored)
+     */
+    default void patchObjects(Iterable<?> objects) {
+        if (objects == null) return;
+        for (Object obj : objects) {
+            patchObject(obj);
+        }
+    }
+
+    /**
      * Patch static fields of the given class.
      *
      * <p>Iterates through all static non-primitive fields of the class and

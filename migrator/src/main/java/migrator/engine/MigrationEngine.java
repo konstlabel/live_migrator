@@ -9,6 +9,7 @@ import migrator.config.MigrationConfig;
 import migrator.config.MigrationConfigLoader;
 import migrator.commit.*;
 import migrator.exceptions.MigrateException;
+import migrator.exceptions.MigrationTimeoutException;
 import migrator.load.*;
 import migrator.heap.*;
 import migrator.metrics.MigrationMetrics;
@@ -23,11 +24,13 @@ import migrator.smoke.SmokeTestReport;
 import migrator.smoke.SmokeTestRunner;
 import migrator.state.MigrationState;
 
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -43,6 +46,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * Notes:
  *  - Engine does NOT perform pause/resume itself; it only signals via MigrationPhaseListener.
  *  - RollbackManager.restore may not return (platform-specific).
+ *  - Migrations must be serialized: a single global {@link MigrationState} and the static
+ *    {@code lastMetrics} assume one migration runs at a time per JVM. Do not run migrations
+ *    concurrently (whether on one engine instance or several).
  */
 public final class MigrationEngine {
 
@@ -65,8 +71,23 @@ public final class MigrationEngine {
     // cache of migrate method per migrator class to avoid reflection cost
     private final ConcurrentMap<Class<?>, Method> migrateMethodCache = new ConcurrentHashMap<>();
 
-    // Configuration: true = full heap walk, false = filtered heap walk for specified classes only
-    private boolean fullHeapWalk = true;
+    // cache of validate method per migrator class; the interface default is a no-op and is skipped
+    private final ConcurrentMap<Class<?>, Method> validateMethodCache = new ConcurrentHashMap<>();
+
+    // Ensures rollback runs once even if the timeout thread and worker thread both react to a failure.
+    private final AtomicBoolean rollbackInvoked = new AtomicBoolean(false);
+
+    // Decides the terminal outcome of a migration exactly once. When migrateWithTimeout runs
+    // doMigrate on a worker thread, both that worker and the timing-out caller can race to finalize:
+    // the winner of this CAS owns the commit-or-rollback decision and the state/metrics recording,
+    // so a migration is never both committed (by the worker) and rolled back (by the timeout), and
+    // its terminal state is recorded only once.
+    private final AtomicBoolean finalized = new AtomicBoolean(false);
+
+    // Configuration: true = full heap walk, false = filtered heap walk for specified classes only.
+    // Filtered is the default: it only tags instances of the classes that can hold references to
+    // migrated objects, avoiding an O(heap) reflective scan during the critical (quiesced) phase.
+    private boolean fullHeapWalk = false;
 
     // Metrics collection
     private final MigrationMetricsCollector metricsCollector = new MigrationMetricsCollector();
@@ -337,6 +358,8 @@ public final class MigrationEngine {
         MigrationEngine engine = new MigrationEngine(classLoader, jarPath);
         engine.applyConfig(config);
 
+        // Note: the heap-walk timeout doubles as the overall migration budget here, as there is no
+        // separate total-migration-timeout setting.
         Duration timeout = config.heapWalkTimeout();
         if (timeout != null && !timeout.isZero() && !timeout.isNegative()) {
             engine.migrateWithTimeout(classesToScan, genericContainers, interfaceType, timeout);
@@ -446,35 +469,46 @@ public final class MigrationEngine {
                     timeout,
                     () -> doMigrate(classesToScan, genericContainers, interfaceType)
             );
+        } catch (MigrationTimeoutException e) {
+            // The overall migration exceeded the timeout. doMigrate runs on a worker thread, which
+            // may be about to commit; claim finalization first so we never roll back a migration the
+            // worker is committing. If the worker already finalized (committed or recorded failure),
+            // surface the timeout without touching its outcome.
+            long migrationId = MigrationState.getInstance().getCurrentMigrationId();
+            if (!finalized.compareAndSet(false, true)) {
+                throw new MigrateException("Migration exceeded " + timeout.toMillis()
+                        + "ms but was finalized by the worker before rollback could start", e);
+            }
+            log.error("Migration timed out after {}, triggering rollback", timeout);
+            MigrationAlertLogger.migrationTimeout(migrationId, timeout.toMillis(), MigrationState.getInstance().getCurrentPhase());
+            MigrationAlertLogger.rollbackTriggered(migrationId, "timeout");
+            try {
+                tryRollback();
+                MigrationAlertLogger.rollbackCompleted(migrationId, true);
+            } catch (Exception rollbackEx) {
+                MigrationAlertLogger.rollbackCompleted(migrationId, false);
+                MigrationState.getInstance().migrationFailed(migrationId, e, lastMetrics);
+                throw new MigrateException("Migration timed out and rollback failed: " + rollbackEx.getMessage(), e);
+            }
+            MigrationState.getInstance().migrationFailed(migrationId, e, lastMetrics);
+            throw new MigrateException("Migration timed out after " + timeout.toMillis() + "ms", e);
         } catch (MigrateException me) {
-            // Already handled, re-throw
+            // doMigrate already reported the failure (and rolled back where applicable); re-throw.
             throw me;
         } catch (Exception e) {
-            if (e.getMessage() != null && e.getMessage().contains("timed out")) {
-                log.error("Migration timed out after {}, triggering rollback", timeout);
-                long migrationId = MigrationState.getInstance().getCurrentMigrationId();
-                MigrationAlertLogger.migrationTimeout(migrationId, timeout.toMillis(), MigrationState.getInstance().getCurrentPhase());
-                MigrationAlertLogger.rollbackTriggered(migrationId, "timeout");
-                try {
-                    rollbackManager.rollback();
-                    MigrationAlertLogger.rollbackCompleted(migrationId, true);
-                } catch (Exception rollbackEx) {
-                    MigrationAlertLogger.rollbackCompleted(migrationId, false);
-                    MigrationState.getInstance().migrationFailed(e, lastMetrics);
-                    throw new MigrateException("Migration timed out and rollback failed: " + rollbackEx.getMessage(), e);
-                }
-                MigrationState.getInstance().migrationFailed(e, lastMetrics);
-                throw new MigrateException("Migration timed out after " + timeout.toMillis() + "ms", e);
-            }
             throw new MigrateException("Migration failed: " + e.getMessage(), e);
         }
     }
 
     private void doMigrate(Collection<Class<?>> classesToScan, Collection<?> genericContainers, Class<?> interfaceType) throws MigrateException {
-        Objects.requireNonNull(classesToScan, "classesToScan");
+        // Empty plan is a no-op: check it before requiring classesToScan so an empty plan never
+        // throws on a null scan list it would not have used.
         if (plan.orderedMigrators().isEmpty()) return;
+        Objects.requireNonNull(classesToScan, "classesToScan");
 
         final long migrationId = MIGRATION_COUNTER.getAndIncrement();
+        rollbackInvoked.set(false);
+        finalized.set(false);
         final MigrationContext ctx = new MigrationContext(plan, migrationId);
         final Set<Object> allResolvedOldObjects = new LinkedHashSet<>();
         final Map<MigratorDescriptor, List<Object>> createdPerMigrator = new LinkedHashMap<>();
@@ -485,7 +519,17 @@ public final class MigrationEngine {
         MigrationAlertLogger.migrationStarted(migrationId);
 
         metricsCollector.start(migrationId).migratorCount(plan.orderedMigrators().size());
-        boolean beforeCriticalCalled = false;
+        // Tracks whether the app may have been quiesced by onBeforeCriticalPhase but not yet
+        // resumed by onAfterCriticalPhase. A one-element array so the critical-phase lambda can
+        // mutate it; the finally block uses it as a safety net to guarantee the app is resumed.
+        // It is set BEFORE onBefore is invoked (so a partial quiesce that throws still gets a
+        // resume) and cleared BEFORE onAfter is attempted (so a failing onAfter is not retried by
+        // the finally — see onAfterCriticalPhase's at-least-once/idempotency contract).
+        final boolean[] beforeCriticalCalled = {false};
+
+        // Set once this thread wins the finalization CAS (claims the commit). It lets the catch
+        // blocks know a post-commit failure is still ours to record, without re-winning the CAS.
+        boolean ownsOutcome = false;
 
         try {
             // FIRST PASS
@@ -507,13 +551,20 @@ public final class MigrationEngine {
             MigrationAlertLogger.phaseStarted(migrationId, Phase.CRITICAL_PHASE);
             long criticalPhaseStart = System.currentTimeMillis();
             metricsCollector.timed(Phase.CRITICAL_PHASE, () -> {
+                // Mark "may be quiesced" before signalling, so even an onBefore that throws after a
+                // partial quiesce is resumed by the finally block.
+                beforeCriticalCalled[0] = true;
                 signalBeforeCriticalPhase(ctx);
+
+                // Compute the set of classes that may hold references to migrated objects once,
+                // then reuse it for both the filtered heap walk and static-field patching.
+                Set<Class<?>> classesToPatch = collectClassesToPatch(classesToScan, pass2Objects);
 
                 // SECOND PASS
                 metricsCollector.timed(Phase.SECOND_PASS, () ->
-                        patchedCount[0] = secondPassPatchReferencesWithCount(pass2Objects, classesToScan));
+                        patchedCount[0] = secondPassPatchReferencesWithCount(pass2Objects, classesToPatch));
 
-                safeAutoPatchStaticFields(classesToScan, pass2Objects);
+                safeAutoPatchStaticFields(classesToPatch);
 
                 // REGISTRY UPDATE
                 metricsCollector.timed(Phase.REGISTRY_UPDATE, () -> {
@@ -522,10 +573,12 @@ public final class MigrationEngine {
                     updateGenericFields(classesToScan, pass2Objects, interfaceType);
                 });
 
+                // Clear before attempting onAfter: it runs exactly once here on the normal path; if
+                // it throws, the finally must not invoke it again.
+                beforeCriticalCalled[0] = false;
                 signalAfterCriticalPhase(ctx);
             });
             MigrationAlertLogger.phaseCompleted(migrationId, Phase.CRITICAL_PHASE, System.currentTimeMillis() - criticalPhaseStart);
-            beforeCriticalCalled = false;
 
             metricsCollector.objectsPatched(patchedCount[0]);
 
@@ -540,12 +593,27 @@ public final class MigrationEngine {
             if (!report.success()) {
                 log.error("Smoke tests failed for migration id={}", migrationId);
                 MigrationAlertLogger.rollbackTriggered(migrationId, "smoke test failure");
-                rollbackManager.rollback();
-                MigrationState.getInstance().migrationFailed(new MigrateException("Smoke tests failed"), lastMetrics);
-                MigrationAlertLogger.migrationFailed(migrationId, new MigrateException("Smoke tests failed"), Phase.SMOKE_TEST, lastMetrics);
+                try {
+                    tryRollback();
+                    MigrationAlertLogger.rollbackCompleted(migrationId, true);
+                } catch (Exception rbEx) {
+                    MigrationAlertLogger.rollbackCompleted(migrationId, false);
+                    throw new MigrateException("Smoke tests failed and rollback failed: " + rbEx.getMessage(), rbEx);
+                }
+                // Failure state, alert and metrics are recorded exactly once by the central
+                // catch(MigrateException) below — don't report them here too (that produced a
+                // duplicate history entry and a duplicate alert).
                 throw new MigrateException("Smoke tests failed for migration id=" + migrationId);
             }
 
+            // Claim the terminal outcome before the irreversible commit. If a concurrently
+            // timing-out caller already finalized (and rolled back) this migration, abort here
+            // rather than deleting the checkpoint — never commit a migration that was rolled back.
+            if (!finalized.compareAndSet(false, true)) {
+                throw new MigrateException(
+                        "Migration was finalized (timed out and rolled back) before commit; aborting");
+            }
+            ownsOutcome = true;
             commitWithRollback();
             migratorAdvanceEpoch();
 
@@ -554,26 +622,38 @@ public final class MigrationEngine {
 
             // Track successful completion
             MigrationState.getInstance().setCurrentPhase(null);
-            MigrationState.getInstance().migrationCompleted(lastMetrics);
+            MigrationState.getInstance().migrationCompleted(migrationId, lastMetrics);
             MigrationAlertLogger.migrationCompleted(migrationId, lastMetrics);
 
         } catch (MigrateException me) {
-            finishMetricsOnError();
-            MigrationState.getInstance().migrationFailed(me, lastMetrics);
-            MigrationAlertLogger.migrationFailed(migrationId, me, MigrationState.getInstance().getCurrentPhase(), lastMetrics);
+            // Record the failure if we own the outcome — either we already claimed it (a post-commit
+            // failure) or we win the CAS now. If the timeout path already finalized (and recorded /
+            // rolled back), don't double-record or fight it; just propagate.
+            if (ownsOutcome || finalized.compareAndSet(false, true)) {
+                finishMetricsOnError();
+                MigrationState.getInstance().migrationFailed(migrationId, me, lastMetrics);
+                MigrationAlertLogger.migrationFailed(migrationId, me, MigrationState.getInstance().getCurrentPhase(), lastMetrics);
+            }
             throw me;
         } catch (Exception e) {
-            finishMetricsOnError();
-            MigrationState.getInstance().migrationFailed(e, lastMetrics);
-            MigrationAlertLogger.migrationFailed(migrationId, e, MigrationState.getInstance().getCurrentPhase(), lastMetrics);
+            if (ownsOutcome || finalized.compareAndSet(false, true)) {
+                finishMetricsOnError();
+                MigrationState.getInstance().migrationFailed(migrationId, e, lastMetrics);
+                MigrationAlertLogger.migrationFailed(migrationId, e, MigrationState.getInstance().getCurrentPhase(), lastMetrics);
+            }
             cleanupAndRollback(allResolvedOldObjects, e);
         } finally {
-            if (beforeCriticalCalled) {
+            if (beforeCriticalCalled[0]) {
                 safeAfterCriticalPhase(ctx, migrationId);
             }
+            // Reset per-migration state so a reused engine starts each run with a clean table and
+            // doesn't pin the previous run's old objects (or leak stale mappings into the next run,
+            // which the MigrateException failure path would otherwise leave behind).
+            forwarding.clear();
         }
     }
 
+    /** Updates caller-supplied generic containers when both the containers and interface type are present. */
     private void updateGenericContainersIfPresent(Collection<?> containers, Class<?> interfaceType) {
         if (containers != null && interfaceType != null) {
             log.debug("Updating {} generic containers", containers.size());
@@ -581,6 +661,7 @@ public final class MigrationEngine {
         }
     }
 
+    /** Updates generic fields in the scanned classes for the migrated types (plus any explicit interface type). */
     private void updateGenericFields(Collection<Class<?>> classesToScan, Set<Object> pass2Objects, Class<?> interfaceType) {
         Set<Class<?>> types = extractMigratedInterfaceTypes();
         if (interfaceType != null) types.add(interfaceType);
@@ -589,11 +670,13 @@ public final class MigrationEngine {
         }
     }
 
+    /** Finalizes metrics on the failure path and logs the partial summary. */
     private void finishMetricsOnError() {
         lastMetrics = metricsCollector.finish();
         log.warn("Migration failed - metrics: {}", lastMetrics.summary());
     }
 
+    /** Invokes the after-critical-phase callback from a finally block, swallowing (logging) any exception. */
     private void safeAfterCriticalPhase(MigrationContext ctx, long migrationId) {
         try {
             phaseListener.onAfterCriticalPhase(ctx);
@@ -648,6 +731,7 @@ public final class MigrationEngine {
         return interfaceTypes;
     }
 
+    /** First pass: runs each migrator in plan order to allocate new objects and populate the forwarding table. */
     private void firstPassAllocateAndMigrate(
         Set<Object> allResolvedOldObjects,
         Map<MigratorDescriptor, List<Object>> createdPerMigrator
@@ -657,6 +741,7 @@ public final class MigrationEngine {
         }
     }
 
+    /** Signals the phase listener to quiesce before the critical phase, under the critical-phase timeout. */
     private void signalBeforeCriticalPhase(MigrationContext ctx) throws MigrateException {
         try {
             TimeoutExecutor.executeWithTimeoutChecked(
@@ -672,6 +757,10 @@ public final class MigrationEngine {
     }
 
 
+    /**
+     * Snapshots all live instances of one migrator's source class and migrates each, recording the
+     * old&rarr;new mapping in the forwarding table. Objects already migrated are skipped.
+     */
     private void processMigrator(
             MigratorDescriptor desc,
             Set<Object> allResolvedOldObjects,
@@ -680,44 +769,43 @@ public final class MigrationEngine {
         Class<?> from = desc.from();
         Object migrator = desc.migrator();
 
-        HeapSnapshot snapshot = TimeoutExecutor.executeWithTimeout(
+        Object[] objects = TimeoutExecutor.executeWithTimeout(
                 "heapSnapshot(" + from.getSimpleName() + ")",
                 timeoutConfig.heapSnapshotTimeout(),
-                () -> heapWalker.snapshot(from)
+                () -> heapWalker.snapshotObjects(from)
         );
-        if (snapshot == null || snapshot.entries().isEmpty()) return;
+        if (objects == null || objects.length == 0) return;
 
         List<Object> createdForThisMigrator = new ArrayList<>();
         createdPerMigrator.put(desc, createdForThisMigrator);
 
-        for (HeapSnapshot.Entry entry : snapshot.entries()) {
-            processHeapEntry(entry, migrator, allResolvedOldObjects, createdForThisMigrator);
+        for (Object oldObj : objects) {
+            if (oldObj == null || forwarding.contains(oldObj)) {
+                if (oldObj != null) allResolvedOldObjects.add(oldObj);
+                continue;
+            }
+
+            Object newObj = invokeMigrate(migrator, oldObj);
+            if (newObj == null) {
+                throw new MigrateException("Migrator returned null for " + oldObj.getClass().getName());
+            }
+
+            invokeValidate(migrator, newObj);
+
+            forwarding.put(oldObj, newObj);
+            allResolvedOldObjects.add(oldObj);
+            createdForThisMigrator.add(newObj);
         }
     }
 
-    private void processHeapEntry(
-            HeapSnapshot.Entry entry,
-            Object migrator,
-            Set<Object> allResolvedOldObjects,
-            List<Object> createdForThisMigrator
-    ) throws MigrateException {
-        Object oldObj = heapWalker.resolve(entry.tag());
-        if (oldObj == null || forwarding.contains(oldObj)) {
-            if (oldObj != null) allResolvedOldObjects.add(oldObj);
-            return;
-        }
-
-        Object newObj = invokeMigrate(migrator, oldObj);
-        if (newObj == null) {
-            throw new MigrateException("Migrator returned null for " + oldObj.getClass().getName());
-        }
-
-        forwarding.put(oldObj, newObj);
-        allResolvedOldObjects.add(oldObj);
-        createdForThisMigrator.add(newObj);
-    }
-
-    private int secondPassPatchReferencesWithCount(Set<Object> pass2Objects, Collection<Class<?>> classesToScan) {
+    /**
+     * Second pass: walks the heap (full or filtered by {@code classesToPatch}) and patches every
+     * reachable object's references to migrated objects. Falls back to patching only the known
+     * pass-2 objects if the heap walk fails.
+     *
+     * @return the number of objects patched
+     */
+    private int secondPassPatchReferencesWithCount(Set<Object> pass2Objects, Set<Class<?>> classesToPatch) {
         Set<Object> objectsToPatch = null;
         int patchedCount = 0;
 
@@ -732,25 +820,23 @@ public final class MigrationEngine {
                 );
             } else {
                 // Filtered heap walk - only walk objects of specified classes
-                log.debug("Using filtered heap walk for {} classes", classesToScan.size());
-                Set<Class<?>> classesToWalk = collectClassesToPatch(classesToScan, pass2Objects);
+                log.debug("Using filtered heap walk for {} classes", classesToPatch.size());
                 objectsToPatch = TimeoutExecutor.executeWithTimeoutChecked(
                         "heapWalkFiltered",
                         timeoutConfig.heapWalkTimeout(),
-                        () -> heapWalker.walkHeap(classesToWalk)
+                        () -> heapWalker.walkHeap(classesToPatch)
                 );
             }
 
             if (objectsToPatch != null && !objectsToPatch.isEmpty()) {
-                for (Object obj : objectsToPatch) {
-                    referencePatcher.patchObject(obj);
-                    patchedCount++;
-                }
-                return patchedCount;
+                // Patch every object returned by the heap walk (each is an independent root).
+                referencePatcher.patchObjects(objectsToPatch);
+                return objectsToPatch.size();
             }
         } catch (Exception e) {
-            // if heapWalker fails, fallback to patch pass2Objects
-            log.debug("heapWalker failed: {}, falling back to pass2Objects", e.toString());
+            // Heap walk failed or timed out: fall back to patching the known pass-2 objects. Note
+            // the fallback itself is unbounded (no timeout), so surface this at warn level.
+            log.warn("heapWalker failed: {}, falling back to pass2Objects (unbounded)", e.toString());
         }
 
         // Fallback: patch only pass2Objects
@@ -761,21 +847,16 @@ public final class MigrationEngine {
         return patchedCount;
     }
 
-    private void safeAutoPatchStaticFields(Collection<Class<?>> classesToScan, Collection<Object> pass2Objects) {
+    /** Patches static fields of every candidate class, isolating (logging) any failure. */
+    private void safeAutoPatchStaticFields(Set<Class<?>> classesToPatch) {
         try {
-            autoPatchStaticFields(classesToScan, pass2Objects);
+            classesToPatch.forEach(this::safePatchStaticFields);
         } catch (Exception e) {
             log.warn("autoPatchStaticFields failed: {}", e.toString());
         }
     }
 
-
-    private void autoPatchStaticFields(Collection<Class<?>> classesToScan, Collection<Object> pass2Objects) {
-        Set<Class<?>> classesToPatch = collectClassesToPatch(classesToScan, pass2Objects);
-
-        classesToPatch.forEach(this::safePatchStaticFields);
-    }
-
+    /** Signals the phase listener to resume after the critical phase; on failure attempts rollback and rethrows. */
     private void signalAfterCriticalPhase(MigrationContext ctx) throws MigrateException {
         try {
             TimeoutExecutor.executeWithTimeoutChecked(
@@ -785,7 +866,7 @@ public final class MigrationEngine {
             );
         } catch (MigrateException me) {
             try {
-                rollbackManager.rollback();
+                tryRollback();
             } catch (Exception rbEx) {
                 throw new MigrateException("onAfterCriticalPhase failed: " + me.getMessage()
                         + " and rollback failed: " + rbEx.getMessage(), rbEx);
@@ -793,7 +874,7 @@ public final class MigrationEngine {
             throw me;
         } catch (Exception e) {
             try {
-                rollbackManager.rollback();
+                tryRollback();
             } catch (Exception rbEx) {
                 throw new MigrateException("onAfterCriticalPhase failed: " + e.getMessage()
                         + " and rollback failed: " + rbEx.getMessage(), rbEx);
@@ -802,6 +883,7 @@ public final class MigrationEngine {
         }
     }
 
+    /** Runs all smoke tests under the configured smoke-test timeout. */
     private SmokeTestReport runSmokeTestsWithTimeout(Map<MigratorDescriptor, List<Object>> createdPerMigrator) {
         return TimeoutExecutor.executeWithTimeout(
                 "smokeTests",
@@ -810,12 +892,13 @@ public final class MigrationEngine {
         );
     }
 
+    /** Commits the migration; if commit fails, attempts rollback and reports both outcomes. */
     private void commitWithRollback() throws MigrateException {
         try {
             commitManager.commit();
         } catch (Exception commitEx) {
             try {
-                rollbackManager.rollback();
+                tryRollback();
             } catch (Exception rbEx) {
                 throw new MigrateException("Commit failed: " + commitEx.getMessage()
                         + ", rollback also failed: " + rbEx.getMessage(), rbEx);
@@ -824,52 +907,44 @@ public final class MigrationEngine {
         }
     }
 
+    /**
+     * Collects the set of classes (and their superclass chains) that may hold references to migrated
+     * objects: the scanned classes plus the concrete classes of all pass-2 objects. Used both to filter
+     * the heap walk and to drive static-field patching.
+     */
     private Set<Class<?>> collectClassesToPatch(Collection<Class<?>> classesToScan, Collection<Object> pass2Objects) {
         Set<Class<?>> classesToPatch = new LinkedHashSet<>();
 
         if (classesToScan != null) {
             for (Class<?> cls : classesToScan) {
-                classesToPatch.addAll(getClassHierarchy(cls));
-                // Include nested/inner classes
-                classesToPatch.addAll(getNestedClasses(cls));
+                addClassHierarchy(cls, classesToPatch);
             }
         }
 
         if (pass2Objects != null) {
             for (Object o : pass2Objects) {
                 if (o == null) continue;
-                Class<?> cls = o.getClass();
-                classesToPatch.addAll(getClassHierarchy(cls));
-                classesToPatch.addAll(getNestedClasses(cls));
+                // Many objects share a class; the early-exit in addClassHierarchy makes
+                // each distinct class (and its supers) cost only one pass.
+                addClassHierarchy(o.getClass(), classesToPatch);
             }
         }
 
         return classesToPatch;
     }
 
-    private Set<Class<?>> getNestedClasses(Class<?> cls) {
-        Set<Class<?>> nested = new LinkedHashSet<>();
-        try {
-            for (Class<?> declared : cls.getDeclaredClasses()) {
-                nested.add(declared);
-                // Recursively get nested classes of nested classes
-                nested.addAll(getNestedClasses(declared));
-            }
-        } catch (Exception e) {
-            // best-effort
-        }
-        return nested;
-    }
-
-    private List<Class<?>> getClassHierarchy(Class<?> cls) {
-        List<Class<?>> hierarchy = new ArrayList<>();
+    /**
+     * Adds {@code cls} and its non-Object superclasses to {@code out}. If {@code cls} is already
+     * present, returns immediately — its superclass chain was added by a prior call.
+     */
+    private void addClassHierarchy(Class<?> cls, Set<Class<?>> out) {
         while (cls != null && cls != Object.class) {
-            hierarchy.add(cls);
+            if (!out.add(cls)) return;
             cls = cls.getSuperclass();
         }
-        return hierarchy;
     }
 
+    /** Patches one class's static fields, isolating (logging) any failure. */
     private void safePatchStaticFields(Class<?> cls) {
         try {
             referencePatcher.patchStaticFields(cls);
@@ -879,6 +954,7 @@ public final class MigrationEngine {
     }
 
 
+    /** Best-effort removal of every old&rarr;new mapping from the forwarding table after a failure. */
     private void cleanupForwarding(Set<Object> allResolvedOldObjects) {
         int removed = 0;
         for (Object oldObj : allResolvedOldObjects) {
@@ -894,14 +970,15 @@ public final class MigrationEngine {
         }
     }
 
+    /** Invokes the migrator's {@code migrate} method on {@code oldObj}, caching the resolved method per migrator class. */
     private Object invokeMigrate(Object migrator, Object oldObj) throws MigrateException {
         try {
             Method m = migrateMethodCache.get(migrator.getClass());
             if (m == null) {
                 m = findMigrateMethod(migrator.getClass());
-                migrateMethodCache.put(migrator.getClass(), m);
+                m.setAccessible(true);
+                migrateMethodCache.putIfAbsent(migrator.getClass(), m);
             }
-            m.setAccessible(true);
             return m.invoke(migrator, oldObj);
         } catch (MigrateException me) {
             throw me;
@@ -910,6 +987,7 @@ public final class MigrationEngine {
         }
     }
 
+    /** Finds the single-arg {@code migrate} method on a migrator class, preferring public then declared. */
     private Method findMigrateMethod(Class<?> cls) throws MigrateException {
         for (Method m : cls.getMethods()) {
             if (m.getName().equals("migrate") && m.getParameterCount() == 1) {
@@ -927,35 +1005,83 @@ public final class MigrationEngine {
         throw new MigrateException("Cannot find migrate(OldT) method on migrator " + cls.getName());
     }
 
-
     /**
-     * Delegates to NativeHeapWalker.advanceEpoch() if available.
-     * @throws MigrateException 
+     * Invokes the migrator's {@code validate(NewT)} hook on a freshly migrated object, if the migrator
+     * overrides it. The {@link ClassMigrator#validate} default is a no-op and is skipped.
      */
-    private void migratorAdvanceEpoch() throws MigrateException {
+    private void invokeValidate(Object migrator, Object newObj) throws MigrateException {
+        Class<?> cls = migrator.getClass();
+        Method m = validateMethodCache.computeIfAbsent(cls, this::findValidateMethod);
+        if (m == null || m.isDefault()) {
+            return; // not overridden — nothing to validate
+        }
         try {
-            Class<?> nhw = Class.forName("migrator.heap.NativeHeapWalker");
-            Method adv = nhw.getMethod("advanceEpoch");
-            adv.setAccessible(true);
-            adv.invoke(null);
-        } catch (ClassNotFoundException cnf) {
-            // Native not present — OK
-        } catch (Exception e) {
-            throw new MigrateException("Failed to advance native epoch: " + e.getMessage(), e);
+            m.invoke(migrator, newObj);
+        } catch (InvocationTargetException ite) {
+            Throwable cause = ite.getCause();
+            if (cause instanceof MigrateException me) throw me;
+            throw new MigrateException("Validation failed for migrated " + cls.getName(), cause);
+        } catch (Exception ex) {
+            throw new MigrateException("Failed to invoke validate on " + cls.getName(), ex);
         }
     }
 
+    /**
+     * Finds the single-arg {@code validate} method, preferring a concrete override over the
+     * synthetic bridge or the interface default. Returns the default itself when not overridden.
+     */
+    private Method findValidateMethod(Class<?> cls) {
+        Method fallback = null;
+        for (Method m : cls.getMethods()) {
+            if (!m.getName().equals("validate") || m.getParameterCount() != 1) continue;
+            if (!m.isDefault() && !m.isBridge()) {
+                m.setAccessible(true);
+                return m; // concrete override
+            }
+            if (fallback == null) fallback = m;
+        }
+        return fallback;
+    }
+
+
+    /**
+     * Best-effort delegation to NativeHeapWalker.advanceEpoch() if available. Runs after commit,
+     * so any failure is logged rather than propagated.
+     */
+    private void migratorAdvanceEpoch() {
+        try {
+            NativeHeapWalker.advanceEpoch();
+        } catch (Throwable t) {
+            // Best-effort native bookkeeping that runs after commit; a failure here — including a
+            // native UnsatisfiedLinkError (an Error) when the agent library isn't loaded — must not
+            // fail an already-committed migration (the checkpoint is gone, rollback is impossible).
+            log.warn("Failed to advance native epoch (migration already committed): {}", t.toString());
+        }
+    }
+
+    /** Invokes the rollback manager at most once per migration; later callers are no-ops. */
+    private void tryRollback() throws Exception {
+        if (rollbackInvoked.compareAndSet(false, true)) {
+            rollbackManager.rollback();
+        }
+    }
+
+    /** Cleans up the forwarding table and triggers rollback after an unexpected failure, reporting both outcomes. */
     private void cleanupAndRollback(Set<Object> allResolvedOldObjects, Exception original) throws MigrateException {
         long migrationId = MigrationState.getInstance().getCurrentMigrationId();
         MigrationAlertLogger.rollbackTriggered(migrationId, original.getMessage());
         try {
             cleanupForwarding(allResolvedOldObjects);
-            rollbackManager.rollback();
+            tryRollback();
             MigrationAlertLogger.rollbackCompleted(migrationId, true);
         } catch (Exception rbEx) {
             MigrationAlertLogger.rollbackCompleted(migrationId, false);
             throw new MigrateException("Migration failed: " + original.getMessage()
                     + " ; attempted rollback failed: " + rbEx.getMessage(), original);
         }
+        // Rollback succeeded, but the migration still failed: surface the original
+        // failure to the caller instead of returning normally (which would falsely
+        // report success for a migration that was reverted).
+        throw new MigrateException("Migration failed and was rolled back: " + original.getMessage(), original);
     }
 }

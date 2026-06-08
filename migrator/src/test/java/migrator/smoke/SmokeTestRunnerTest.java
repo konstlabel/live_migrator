@@ -12,6 +12,9 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+/**
+ * Unit tests for {@link SmokeTestRunner}.
+ */
 @DisplayName("SmokeTestRunner")
 class SmokeTestRunnerTest {
 
@@ -312,6 +315,55 @@ class SmokeTestRunnerTest {
 
             assertThat(report.success()).isFalse();
             assertThat(report.results().get(0).error()).isInstanceOf(RuntimeException.class);
+        }
+
+        @Test
+        @DisplayName("should isolate an AssertionError thrown by a smoke test as a failed result")
+        void shouldIsolateAssertionErrorFromSmokeTest() {
+            SmokeTestRunner runner = new SmokeTestRunner.Builder()
+                    .addSmokeTest(created -> {
+                        throw new AssertionError("assertion in smoke test");
+                    })
+                    .addSmokeTest(created -> SmokeTestResult.ok("after"))
+                    .build();
+
+            SmokeTestReport report = runner.runAll(Map.of());
+
+            // The throwing test must not abort the run: the second test still executes.
+            assertThat(report.success()).isFalse();
+            assertThat(report.results()).hasSize(2);
+            assertThat(report.results().get(0).isOk()).isFalse();
+            assertThat(report.results().get(0).error()).isInstanceOf(AssertionError.class);
+            assertThat(report.results().get(1).isOk()).isTrue();
+        }
+
+        @Test
+        @DisplayName("should isolate an Error thrown by a health check as a failed result")
+        void shouldIsolateErrorFromHealthCheck() {
+            SmokeTestRunner runner = new SmokeTestRunner.Builder()
+                    .addHealthCheck(() -> { throw new AssertionError("boom"); })
+                    .addHealthCheck(() -> true)
+                    .build();
+
+            SmokeTestReport report = runner.runAll(Map.of());
+
+            assertThat(report.success()).isFalse();
+            assertThat(report.results()).hasSize(2);
+            assertThat(report.results().get(0).error()).isInstanceOf(AssertionError.class);
+            assertThat(report.results().get(1).isOk()).isTrue();
+        }
+
+        @Test
+        @DisplayName("should treat a null createdPerMigrator as an empty map")
+        void shouldTreatNullCreatedPerMigratorAsEmpty() {
+            SmokeTestRunner runner = new SmokeTestRunner.Builder()
+                    .addSmokeTest(created -> SmokeTestResult.ok(created.isEmpty() ? "empty" : "non-empty"))
+                    .build();
+
+            SmokeTestReport report = runner.runAll(null);
+
+            assertThat(report.success()).isTrue();
+            assertThat(report.results().get(0).name()).isEqualTo("empty");
         }
 
         @Test

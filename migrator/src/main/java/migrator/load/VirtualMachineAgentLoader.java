@@ -19,12 +19,19 @@ import migrator.exceptions.MigrateException;
  * LoaderResult result = loader.load("12345", "/path/to/agent.jar");
  * </pre>
  *
+ * <p>On failure this loader throws {@link MigrateException} rather than returning an
+ * unsuccessful {@link LoaderResult}; a returned result is always a success.
+ *
  * @see AgentLoader
  */
 public class VirtualMachineAgentLoader implements AgentLoader {
 
     private static final Logger log = LoggerFactory.getLogger(VirtualMachineAgentLoader.class);
 
+    /**
+     * Loads the agent, passing {@code agentJarPath} itself as the agent arguments: the
+     * migration agent uses that argument as the JAR path to scan for migration components.
+     */
     @Override
     public LoaderResult load(String pid, String agentJarPath) throws MigrateException {
         return load(pid, agentJarPath, agentJarPath);
@@ -49,7 +56,7 @@ public class VirtualMachineAgentLoader implements AgentLoader {
             log.info("Agent loaded successfully into JVM {}", pid);
             return LoaderResult.success(pid, agentJarPath);
         } catch (Exception e) {
-            String message = "Failed to attach and load agent: " + e.getMessage();
+            String message = "Failed to attach and load agent: " + e;
             log.error(message, e);
             throw new MigrateException(message, e);
         } finally {

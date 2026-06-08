@@ -61,12 +61,25 @@ public final class MigrationAlertLogger {
         return alertLevel;
     }
 
+    /** @return true when INFO/DEBUG events should be logged (alert level DEBUG). */
     private static boolean shouldLogInfo() {
         return alertLevel == AlertLevel.DEBUG;
     }
 
+    /** @return true when WARN events should be logged (alert level DEBUG or WARNING). */
     private static boolean shouldLogWarn() {
         return alertLevel == AlertLevel.DEBUG || alertLevel == AlertLevel.WARNING;
+    }
+
+    /** Maps a phase to its name, or {@code "UNKNOWN"} when null. */
+    private static String name(Phase phase) {
+        return phase != null ? phase.name() : "UNKNOWN";
+    }
+
+    /** Flattens free text so it can't break the single-line key="value" format (newlines, quotes). */
+    private static String sanitize(String s) {
+        if (s == null) return null;
+        return s.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ').replace('"', '\'');
     }
 
     /**
@@ -88,7 +101,7 @@ public final class MigrationAlertLogger {
      */
     public static void phaseStarted(long migrationId, Phase phase) {
         if (shouldLogInfo()) {
-            log.info("PHASE_STARTED id={} phase={}", migrationId, phase.name());
+            log.info("PHASE_STARTED id={} phase={}", migrationId, name(phase));
         }
     }
 
@@ -101,7 +114,7 @@ public final class MigrationAlertLogger {
      */
     public static void phaseCompleted(long migrationId, Phase phase, long durationMs) {
         if (shouldLogInfo()) {
-            log.info("PHASE_COMPLETED id={} phase={} duration_ms={}", migrationId, phase.name(), durationMs);
+            log.info("PHASE_COMPLETED id={} phase={} duration_ms={}", migrationId, name(phase), durationMs);
         }
     }
 
@@ -113,12 +126,16 @@ public final class MigrationAlertLogger {
      */
     public static void migrationCompleted(long migrationId, MigrationMetrics metrics) {
         if (shouldLogInfo()) {
-            log.info("MIGRATION_COMPLETED id={} duration_ms={} objects_migrated={} objects_patched={} heap_delta={}",
-                    migrationId,
-                    metrics.totalDurationMs(),
-                    metrics.objectsMigrated(),
-                    metrics.objectsPatched(),
-                    metrics.heapDelta());
+            if (metrics != null) {
+                log.info("MIGRATION_COMPLETED id={} duration_ms={} objects_migrated={} objects_patched={} heap_delta={}",
+                        migrationId,
+                        metrics.totalDurationMs(),
+                        metrics.objectsMigrated(),
+                        metrics.objectsPatched(),
+                        metrics.heapDelta());
+            } else {
+                log.info("MIGRATION_COMPLETED id={}", migrationId);
+            }
         }
     }
 
@@ -131,8 +148,8 @@ public final class MigrationAlertLogger {
      * @param partialMetrics partial metrics if available (may be null)
      */
     public static void migrationFailed(long migrationId, Throwable error, Phase currentPhase, MigrationMetrics partialMetrics) {
-        String errorMsg = error != null ? error.getMessage() : "Unknown error";
-        String phaseName = currentPhase != null ? currentPhase.name() : "UNKNOWN";
+        String errorMsg = sanitize(error != null ? error.getMessage() : "Unknown error");
+        String phaseName = name(currentPhase);
 
         if (partialMetrics != null) {
             log.error("MIGRATION_FAILED id={} phase={} error=\"{}\" duration_ms={} objects_migrated={}",
@@ -153,7 +170,7 @@ public final class MigrationAlertLogger {
      */
     public static void rollbackTriggered(long migrationId, String reason) {
         if (shouldLogWarn()) {
-            log.warn("ROLLBACK_TRIGGERED id={} reason=\"{}\"", migrationId, reason);
+            log.warn("ROLLBACK_TRIGGERED id={} reason=\"{}\"", migrationId, sanitize(reason));
         }
     }
 
@@ -183,7 +200,6 @@ public final class MigrationAlertLogger {
      */
     public static void migrationTimeout(long migrationId, long timeoutMs, Phase currentPhase) {
         // Always log errors
-        String phaseName = currentPhase != null ? currentPhase.name() : "UNKNOWN";
-        log.error("MIGRATION_TIMEOUT id={} timeout_ms={} phase={}", migrationId, timeoutMs, phaseName);
+        log.error("MIGRATION_TIMEOUT id={} timeout_ms={} phase={}", migrationId, timeoutMs, name(currentPhase));
     }
 }

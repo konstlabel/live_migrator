@@ -1,7 +1,5 @@
 package migrator.crac;
 
-import migrator.exceptions.MigrateException;
-
 /**
  * Default no-op implementation of {@link CracController}.
  *
@@ -44,7 +42,7 @@ public enum NoopCracController implements CracController {
      * @throws UnsupportedOperationException always
      */
     @Override
-    public void restoreFromCheckpoint() throws MigrateException {
+    public void restoreFromCheckpoint() {
         throw new UnsupportedOperationException("CRaC restore not supported in NoopCracController");
     }
 }

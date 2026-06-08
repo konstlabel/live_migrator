@@ -9,6 +9,9 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+/**
+ * Unit tests for {@link MigratorDescriptor}.
+ */
 @DisplayName("MigratorDescriptor")
 class MigratorDescriptorTest {
 
@@ -118,6 +121,17 @@ class MigratorDescriptorTest {
         }
     }
 
+    /** Has only a parameterized constructor — no no-arg constructor of any visibility. */
+    static class NoNoArgConstructorMigrator implements ClassMigrator<OldUser, NewUser> {
+        @SuppressWarnings("unused")
+        NoNoArgConstructorMigrator(int unused) {}
+
+        @Override
+        public NewUser migrate(OldUser old) {
+            return new NewUser(old.getId(), old.getName());
+        }
+    }
+
     @Nested
     @DisplayName("constructor")
     class Constructor {
@@ -166,9 +180,21 @@ class MigratorDescriptorTest {
         @Test
         @DisplayName("should throw when migrator has no no-arg constructor")
         void shouldThrowWhenNoNoArgConstructor() {
-            assertThatThrownBy(() -> new MigratorDescriptor(PrivateConstructorMigrator.class))
+            assertThatThrownBy(() -> new MigratorDescriptor(NoNoArgConstructorMigrator.class))
                     .isInstanceOf(IllegalArgumentException.class)
                     .hasMessageContaining("Cannot instantiate migrator");
+        }
+
+        @Test
+        @DisplayName("should instantiate a migrator with a private no-arg constructor")
+        void shouldInstantiateMigratorWithPrivateConstructor() {
+            // The descriptor makes the no-arg constructor accessible regardless of visibility,
+            // consistent with how ComponentResolver instantiates other components.
+            MigratorDescriptor descriptor = new MigratorDescriptor(PrivateConstructorMigrator.class);
+
+            assertThat(descriptor.migrator()).isInstanceOf(PrivateConstructorMigrator.class);
+            assertThat(descriptor.from()).isEqualTo(OldUser.class);
+            assertThat(descriptor.to()).isEqualTo(NewUser.class);
         }
     }
 

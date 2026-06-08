@@ -7,6 +7,7 @@ package migrator.phase;
  * migrations to proceed without application-level coordination.
  */
 public enum NoopPhaseListener implements MigrationPhaseListener {
+    /** The singleton instance. */
     INSTANCE;
 
     @Override

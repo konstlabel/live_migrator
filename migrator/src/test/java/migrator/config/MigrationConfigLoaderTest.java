@@ -10,6 +10,9 @@ import java.time.Duration;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+/**
+ * Unit tests for {@link MigrationConfigLoader}.
+ */
 class MigrationConfigLoaderTest {
 
     @TempDir
@@ -102,7 +105,7 @@ class MigrationConfigLoaderTest {
 
         MigrationConfig c = MigrationConfigLoader.loadFromFile(f);
 
-        assertEquals(HeapWalkMode.FULL, c.heapWalkMode());
+        assertEquals(HeapWalkMode.SPEC, c.heapWalkMode());
         assertEquals(AlertLevel.WARNING, c.alertLevel());
         assertEquals(Duration.ZERO, c.heapWalkTimeout());
     }

@@ -8,9 +8,15 @@
  *
  * Key features:
  *   - Epoch-based object tagging for stable identification across GC cycles
- *   - Full heap walk to find all instances of a specific class
- *   - Filtered heap walk for multiple target classes
- *   - Object resolution by tag
+ *   - Full heap walk to find all live objects
+ *   - Per-class snapshot and filtered heap walk for multiple target classes
+ *
+ * Performance note: every matched object in a single walk is tagged with the SAME
+ * per-walk tag value, and objects are resolved with one GetObjectsWithTags(count=1)
+ * call. This matters because GetObjectsWithTags scans the whole tag map and does a
+ * linear search over the supplied tag array per entry — passing N distinct tags makes
+ * it O(N^2). A single shared tag keeps the resolve O(heap). The per-walk epoch makes
+ * the shared tag unique to this walk, so tags left over from earlier walks never match.
  *
  * The agent can be loaded at JVM startup (-agentpath) or attached dynamically
  * to a running JVM via the Attach API.
@@ -30,12 +36,21 @@ static JavaVM* g_vm = NULL;
 static jvmtiEnv* g_jvmti = NULL;
 
 /**
- * Epoch-based tagging system.
- * Tags are formed as: (epoch << 32) | local_counter
- * This ensures unique tags across migration cycles.
+ * Epoch counter. Bumped at the start of every walk so each walk uses a tag value
+ * distinct from all prior walks. The tag written to every matched object is
+ * WALK_TAG(g_epoch); resolving queries that single value.
  */
 static volatile jlong g_epoch = 1;
-static volatile jlong g_local_counter = 1;
+
+/** The single tag value used for all objects matched during the current walk. */
+#define WALK_TAG(epoch) ((jlong)((((uint64_t)(uint32_t)(epoch)) << 32) | 1ULL))
+
+/**
+ * heap_filter for IterateThroughHeap: 0 = no JVMTI_HEAP_FILTER_* bits set, i.e. report
+ * every object. (Not JVMTI_HEAP_OBJECT_EITHER — that enum is for the deprecated
+ * IterateOverHeap API and is not a valid heap_filter bitmask.)
+ */
+#define HEAP_FILTER_NONE 0
 
 /**
  * Prints JVMTI error information to stderr.
@@ -48,64 +63,17 @@ static void check_print(jvmtiEnv* jvmti, jvmtiError err, const char* msg) {
                 (int)err,
                 name ? name : "UNKNOWN",
                 msg);
+        if (jvmti && name) (*jvmti)->Deallocate(jvmti, (unsigned char*) name);
     }
 }
 
 /**
- * Dynamic array for collecting object tags during heap iteration.
- */
-typedef struct {
-    jlong* tags;
-    jint count;
-    jint capacity;
-    int alloc_failed;
-} tag_collector_t;
-
-/**
- * Adds a tag to the collector, growing the array if needed.
- * @return 0 on success, -1 on allocation failure
- */
-static int tag_add(tag_collector_t* c, jlong tag) {
-    if (c->alloc_failed) return -1;
-    if (c->count >= c->capacity) {
-        jint newCap = c->capacity == 0 ? 128 : c->capacity * 2;
-        jlong* tmp = (jlong*) realloc(c->tags, sizeof(jlong) * (size_t)newCap);
-        if (!tmp) {
-            c->alloc_failed = 1;
-            return -1;
-        }
-        c->tags = tmp;
-        c->capacity = newCap;
-    }
-    c->tags[c->count++] = tag;
-    return 0;
-}
-
-/**
- * JVMTI callback to clear all object tags.
- */
-static jint JNICALL clear_tag_cb(
-        jlong class_tag,
-        jlong size,
-        jlong* tag_ptr,
-        jint length,
-        void* user_data) {
-
-    (void) class_tag;
-    (void) size;
-    (void) length;
-    (void) user_data;
-
-    if (tag_ptr && *tag_ptr != 0) {
-        *tag_ptr = 0;
-    }
-    return JVMTI_ITERATION_CONTINUE;
-}
-
-/**
- * JVMTI callback to tag heap objects.
- * Assigns a unique tag (epoch:local) to each untagged object.
- * Aborts iteration on allocation failure.
+ * JVMTI callback to tag heap objects for the current walk.
+ *
+ * The per-walk tag is passed via user_data (a pointer to the jlong walk_tag) so the
+ * callback never reads the shared g_epoch — each walk tags with its own value, even if
+ * walks overlap. An object already carrying this walk's tag is left as-is (cheap
+ * idempotence when it matches several target classes); any other value is overwritten.
  */
 static jint JNICALL heap_tagging_cb(
         jlong class_tag,
@@ -118,283 +86,57 @@ static jint JNICALL heap_tagging_cb(
     (void) size;
     (void) length;
 
-    tag_collector_t* col = (tag_collector_t*) user_data;
-    if (!tag_ptr) return JVMTI_ITERATION_CONTINUE;
+    if (!tag_ptr || !user_data) return JVMTI_ITERATION_CONTINUE;
 
-    if (*tag_ptr != 0) {
+    jlong walk_tag = *(const jlong*) user_data;
+    if (*tag_ptr == walk_tag) {
         return JVMTI_ITERATION_CONTINUE;
     }
 
-    jlong local = __sync_fetch_and_add(&g_local_counter, 1);
-    uint64_t tag64 = (((uint64_t)(uint32_t)g_epoch) << 32) | ((uint64_t)local & 0xFFFFFFFFULL);
-    jlong tag = (jlong) tag64;
-
-    *tag_ptr = tag;
-
-    if (tag_add(col, tag) != 0) {
-        return JVMTI_ITERATION_ABORT;
-    }
-
+    *tag_ptr = walk_tag;
     return JVMTI_ITERATION_CONTINUE;
 }
 
 /**
- * Clears all object tags in the heap.
- */
-static void clear_all_tags() {
-    if (!g_jvmti) return;
-    jvmtiHeapCallbacks cb;
-    memset(&cb, 0, sizeof(cb));
-    cb.heap_iteration_callback = &clear_tag_cb;
-    jvmtiError err = (*g_jvmti)->IterateThroughHeap(g_jvmti, JVMTI_HEAP_OBJECT_EITHER, NULL, &cb, NULL);
-    check_print(g_jvmti, err, "IterateThroughHeap(clear) failed");
-}
-
-/**
- * Creates a heap snapshot for objects of a specific class.
+ * Resolves every object carrying the given per-walk tag into a Java Object[].
  *
- * Returns a byte array containing:
- *   - 4 bytes: object count (big-endian)
- *   - For each object:
- *     - 8 bytes: tag (big-endian)
- *     - 4 bytes: class name length (big-endian)
- *     - N bytes: class name (UTF-8)
- *
- * @param jClassName Internal class name (e.g., "service/model/OldUser")
- * @return Byte array with snapshot data, or NULL on error
+ * One GetObjectsWithTags(count=1) call — O(heap), not O(heap * tags). Returns NULL
+ * on error or when nothing matched. Deallocates all JVMTI-owned buffers.
  */
-#undef Java_migrator_heap_NativeHeapWalker_nativeSnapshotBytes
-JNIEXPORT jbyteArray JNICALL
-Java_migrator_heap_NativeHeapWalker_nativeSnapshotBytes(
-        JNIEnv* env,
-        jclass cls,
-        jstring jClassName) {
-
-    (void) cls;
-
-    if (!g_jvmti || !env || !jClassName) return NULL;
-
-    clear_all_tags();
-    __sync_synchronize();
-    g_local_counter = 1;
-
-    const char* className = (*env)->GetStringUTFChars(env, jClassName, NULL);
-    if (!className) return NULL;
-
-    jclass targetClass = (*env)->FindClass(env, className);
-    if (!targetClass) {
-        (*env)->ReleaseStringUTFChars(env, jClassName, className);
-        return NULL;
-    }
-
-    tag_collector_t col;
-    memset(&col, 0, sizeof(col));
-
-    jvmtiHeapCallbacks callbacks;
-    memset(&callbacks, 0, sizeof(callbacks));
-    callbacks.heap_iteration_callback = &heap_tagging_cb;
-
-    jvmtiError err = (*g_jvmti)->IterateThroughHeap(g_jvmti, JVMTI_HEAP_OBJECT_EITHER, targetClass, &callbacks, &col);
-    if (err != JVMTI_ERROR_NONE) {
-        check_print(g_jvmti, err, "IterateThroughHeap(tagging) failed");
-    }
-
-    jint count = col.count;
+static jobjectArray resolve_walk_tag(JNIEnv* env, jlong walk_tag) {
     jint found = 0;
     jobject* objects = NULL;
     jlong* tagsOut = NULL;
-    if (count > 0) {
-        err = (*g_jvmti)->GetObjectsWithTags(g_jvmti, count, col.tags, &found, &objects, &tagsOut);
-        if (err != JVMTI_ERROR_NONE) {
-            check_print(g_jvmti, err, "GetObjectsWithTags failed");
-            found = 0;
-            objects = NULL;
-            tagsOut = NULL;
-        }
-    }
 
-    jclass classClass = (*env)->FindClass(env, "java/lang/Class");
-    if (classClass == NULL) {
+    jvmtiError err = (*g_jvmti)->GetObjectsWithTags(
+            g_jvmti, 1, &walk_tag, &found, &objects, &tagsOut);
+    if (err != JVMTI_ERROR_NONE) {
+        check_print(g_jvmti, err, "GetObjectsWithTags failed");
         if (objects) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) objects);
         if (tagsOut) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) tagsOut);
-        if (col.tags) free(col.tags);
-        (*env)->ReleaseStringUTFChars(env, jClassName, className);
-        return NULL;
-    }
-    jmethodID getName = (*env)->GetMethodID(env, classClass, "getName", "()Ljava/lang/String;");
-    if (getName == NULL) {
-        if (objects) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) objects);
-        if (tagsOut) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) tagsOut);
-        if (col.tags) free(col.tags);
-        (*env)->ReleaseStringUTFChars(env, jClassName, className);
         return NULL;
     }
 
-    char** names = NULL;
-    int* lens = NULL;
-    size_t total = 4;
-
-    if (found > 0) {
-        names = (char**) calloc((size_t)found, sizeof(char*));
-        lens = (int*) calloc((size_t)found, sizeof(int));
-        if (!names || !lens) {
-            check_print(g_jvmti, JVMTI_ERROR_OUT_OF_MEMORY, "calloc failed for names/lens");
-            if (names) free(names);
-            if (lens) free(lens);
-            if (objects) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) objects);
-            if (tagsOut) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) tagsOut);
-            if (col.tags) free(col.tags);
-            (*env)->ReleaseStringUTFChars(env, jClassName, className);
-            return NULL;
-        }
-    }
-
-    for (jint i = 0; i < found; i++) {
-        jobject obj = objects[i];
-        if (obj == NULL) {
-            names[i] = NULL;
-            lens[i] = 0;
-            continue;
-        }
-
-        jclass oc = (*env)->GetObjectClass(env, obj);
-        if (oc == NULL) {
+    jobjectArray result = NULL;
+    if (found > 0 && objects != NULL) {
+        /* GetObjectsWithTags hands back `found` live local references at once; ask the
+         * VM to guarantee room for them plus the array and class refs we create here. */
+        if ((*env)->EnsureLocalCapacity(env, found + 16) != 0) {
             if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
-            names[i] = NULL;
-            lens[i] = 0;
-            (*env)->DeleteLocalRef(env, obj);
-            continue;
         }
-
-        jstring jn = (jstring)(*env)->CallObjectMethod(env, oc, getName);
-        if ((*env)->ExceptionCheck(env)) {
-            (*env)->ExceptionClear(env);
-            (*env)->DeleteLocalRef(env, oc);
-            (*env)->DeleteLocalRef(env, obj);
-            names[i] = NULL;
-            lens[i] = 0;
-            continue;
+        jclass objClass = (*env)->FindClass(env, "java/lang/Object");
+        if (objClass != NULL) {
+            result = (*env)->NewObjectArray(env, found, objClass, NULL);
+            (*env)->DeleteLocalRef(env, objClass);
         }
-
-        const char* cn = (*env)->GetStringUTFChars(env, jn, NULL);
-        if (!cn) {
-            (*env)->DeleteLocalRef(env, jn);
-            (*env)->DeleteLocalRef(env, oc);
-            (*env)->DeleteLocalRef(env, obj);
-            names[i] = NULL;
-            lens[i] = 0;
-            continue;
-        }
-
-        int len = (int) strlen(cn);
-        char* copy = NULL;
-        if (len > 0) {
-            copy = (char*) malloc((size_t)len);
-            if (!copy) {
-                (*env)->ReleaseStringUTFChars(env, jn, cn);
-                (*env)->DeleteLocalRef(env, jn);
-                (*env)->DeleteLocalRef(env, oc);
-                (*env)->DeleteLocalRef(env, obj);
-                check_print(g_jvmti, JVMTI_ERROR_OUT_OF_MEMORY, "malloc for name copy failed");
-                for (jint k = 0; k < i; k++) if (names[k]) free(names[k]);
-                free(names);
-                free(lens);
-                if (objects) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) objects);
-                if (tagsOut) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) tagsOut);
-                if (col.tags) free(col.tags);
-                (*env)->ReleaseStringUTFChars(env, jClassName, className);
-                return NULL;
+        for (jint i = 0; i < found; i++) {
+            jobject o = objects[i];
+            if (result != NULL) {
+                (*env)->SetObjectArrayElement(env, result, i, o);
             }
-            memcpy(copy, cn, (size_t)len);
-        } else {
-            copy = NULL;
-        }
-
-        names[i] = copy;
-        lens[i] = len;
-        total += 8 + 4 + (size_t)len;
-
-        (*env)->ReleaseStringUTFChars(env, jn, cn);
-        (*env)->DeleteLocalRef(env, jn);
-        (*env)->DeleteLocalRef(env, oc);
-        (*env)->DeleteLocalRef(env, obj);
-    }
-
-    if (total > (size_t)INT_MAX) {
-        check_print(g_jvmti, JVMTI_ERROR_INTERNAL, "Snapshot size exceeds INT_MAX");
-        for (jint i = 0; i < found; i++) if (names && names[i]) free(names[i]);
-        if (names) free(names);
-        if (lens) free(lens);
-        if (objects) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) objects);
-        if (tagsOut) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) tagsOut);
-        if (col.tags) free(col.tags);
-        (*env)->ReleaseStringUTFChars(env, jClassName, className);
-        return NULL;
-    }
-
-    size_t bufSize = total;
-    unsigned char* buf = (unsigned char*) malloc(bufSize);
-    if (!buf) {
-        check_print(g_jvmti, JVMTI_ERROR_OUT_OF_MEMORY, "malloc for output buffer failed");
-        for (jint i = 0; i < found; i++) if (names && names[i]) free(names[i]);
-        if (names) free(names);
-        if (lens) free(lens);
-        if (objects) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) objects);
-        if (tagsOut) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) tagsOut);
-        if (col.tags) free(col.tags);
-        (*env)->ReleaseStringUTFChars(env, jClassName, className);
-        return NULL;
-    }
-
-    unsigned char* p = buf;
-    jint be_count = found;
-    p[0] = (unsigned char)((be_count >> 24) & 0xFF);
-    p[1] = (unsigned char)((be_count >> 16) & 0xFF);
-    p[2] = (unsigned char)((be_count >> 8) & 0xFF);
-    p[3] = (unsigned char)(be_count & 0xFF);
-    p += 4;
-
-    for (jint i = 0; i < found; i++) {
-        jlong t = tagsOut ? tagsOut[i] : 0;
-        uint64_t ut = (uint64_t) t;
-        for (int b = 7; b >= 0; b--) {
-            p[b] = (unsigned char)(ut & 0xFF);
-            ut >>= 8;
-        }
-        p += 8;
-
-        int l = lens[i];
-        p[0] = (unsigned char)((l >> 24) & 0xFF);
-        p[1] = (unsigned char)((l >> 16) & 0xFF);
-        p[2] = (unsigned char)((l >> 8) & 0xFF);
-        p[3] = (unsigned char)(l & 0xFF);
-        p += 4;
-
-        if (l > 0 && names[i] != NULL) {
-            memcpy(p, names[i], (size_t)l);
-            p += l;
+            if (o) (*env)->DeleteLocalRef(env, o);
         }
     }
-
-    jbyteArray out = (*env)->NewByteArray(env, (jsize) bufSize);
-    if (!out) {
-        check_print(g_jvmti, JVMTI_ERROR_OUT_OF_MEMORY, "NewByteArray failed");
-        free(buf);
-        for (jint i = 0; i < found; i++) if (names && names[i]) free(names[i]);
-        if (names) free(names);
-        if (lens) free(lens);
-        if (objects) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) objects);
-        if (tagsOut) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) tagsOut);
-        if (col.tags) free(col.tags);
-        (*env)->ReleaseStringUTFChars(env, jClassName, className);
-        return NULL;
-    }
-    (*env)->SetByteArrayRegion(env, out, 0, (jsize) bufSize, (jbyte*) buf);
-    free(buf);
-
-    for (jint i = 0; i < found; i++) if (names && names[i]) free(names[i]);
-    if (names) free(names);
-    if (lens) free(lens);
 
     if (objects) {
         jvmtiError derr = (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) objects);
@@ -404,51 +146,43 @@ Java_migrator_heap_NativeHeapWalker_nativeSnapshotBytes(
         jvmtiError derr = (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) tagsOut);
         check_print(g_jvmti, derr, "Deallocate(tagsOut) failed");
     }
-    if (col.tags) free(col.tags);
-
-    (*env)->ReleaseStringUTFChars(env, jClassName, className);
-    return out;
+    return result;
 }
 
 /**
- * Resolves a tagged object back to a Java reference.
+ * Snapshot of all instances of a single class, returned as an Object[].
  *
- * @param tag The object tag assigned during heap snapshot
- * @return The Java object, or NULL if not found or GC'd
+ * The target class is passed as a jclass resolved by the Java caller, so instances are
+ * found regardless of which classloader loaded the class.
+ *
+ * @param targetClass the class whose instances to snapshot
+ * @return Object array of all instances, or NULL on error/empty
  */
-JNIEXPORT jobject JNICALL
-Java_migrator_heap_NativeHeapWalker_nativeResolve(
+JNIEXPORT jobjectArray JNICALL
+Java_migrator_heap_NativeHeapWalker_nativeSnapshotObjects(
         JNIEnv* env,
         jclass cls,
-        jlong tag) {
+        jclass targetClass) {
 
     (void) cls;
-    if (!g_jvmti || !env) return NULL;
 
-    jobject* objs = NULL;
-    jint count = 0;
-    jlong jtag = tag;
-    jvmtiError err = (*g_jvmti)->GetObjectsWithTags(g_jvmti, 1, &jtag, &count, &objs, NULL);
+    if (!g_jvmti || !env || !targetClass) return NULL;
+
+    /* Fresh epoch -> fresh per-walk tag (avoids an O(heap) clear of old tags). */
+    jlong walk_tag = WALK_TAG(__sync_add_and_fetch(&g_epoch, 1));
+
+    jvmtiHeapCallbacks callbacks;
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.heap_iteration_callback = &heap_tagging_cb;
+
+    jvmtiError err = (*g_jvmti)->IterateThroughHeap(
+            g_jvmti, HEAP_FILTER_NONE, targetClass, &callbacks, &walk_tag);
     if (err != JVMTI_ERROR_NONE) {
-        check_print(g_jvmti, err, "GetObjectsWithTags(nativeResolve) failed");
-        if (objs) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) objs);
+        check_print(g_jvmti, err, "IterateThroughHeap(snapshotObjects) failed");
         return NULL;
     }
 
-    jobject res = NULL;
-    if (count > 0 && objs != NULL) {
-        res = objs[0];
-        for (jint i = 1; i < count; i++) {
-            if (objs[i]) (*env)->DeleteLocalRef(env, objs[i]);
-        }
-    }
-
-    if (objs) {
-        jvmtiError derr = (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) objs);
-        check_print(g_jvmti, derr, "Deallocate(nativeResolve objs) failed");
-    }
-
-    return res;
+    return resolve_walk_tag(env, walk_tag);
 }
 
 /**
@@ -458,227 +192,70 @@ Java_migrator_heap_NativeHeapWalker_nativeResolve(
  */
 JNIEXPORT jobjectArray JNICALL
 Java_migrator_heap_NativeHeapWalker_nativeWalkHeap(JNIEnv *env, jobject thisObj) {
-    (void)thisObj;
+    (void) thisObj;
 
     if (!g_jvmti || !env) return NULL;
 
-    clear_all_tags();
-    __sync_synchronize();
-    g_local_counter = 1;
-
-    tag_collector_t col;
-    memset(&col, 0, sizeof(col));
+    jlong walk_tag = WALK_TAG(__sync_add_and_fetch(&g_epoch, 1));
 
     jvmtiHeapCallbacks callbacks;
     memset(&callbacks, 0, sizeof(callbacks));
     callbacks.heap_iteration_callback = &heap_tagging_cb;
 
-    jvmtiError err = (*g_jvmti)->IterateThroughHeap(g_jvmti, JVMTI_HEAP_OBJECT_EITHER, NULL, &callbacks, &col);
+    jvmtiError err = (*g_jvmti)->IterateThroughHeap(
+            g_jvmti, HEAP_FILTER_NONE, NULL, &callbacks, &walk_tag);
     if (err != JVMTI_ERROR_NONE) {
-        check_print(g_jvmti, err, "IterateThroughHeap in nativeWalkHeap failed");
-    }
-
-    jint count = col.count;
-    if (count <= 0) {
-        if (col.tags) free(col.tags);
+        check_print(g_jvmti, err, "IterateThroughHeap(nativeWalkHeap) failed");
         return NULL;
     }
 
-    jint found = 0;
-    jobject* objects = NULL;
-    jlong* tagsOut = NULL;
-
-    err = (*g_jvmti)->GetObjectsWithTags(g_jvmti, count, col.tags, &found, &objects, &tagsOut);
-    if (err != JVMTI_ERROR_NONE) {
-        check_print(g_jvmti, err, "GetObjectsWithTags(nativeWalkHeap) failed");
-        if (col.tags) free(col.tags);
-        return NULL;
-    }
-
-    jclass objClass = (*env)->FindClass(env, "java/lang/Object");
-    if (objClass == NULL) {
-        if (objects) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) objects);
-        if (tagsOut) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) tagsOut);
-        if (col.tags) free(col.tags);
-        return NULL;
-    }
-
-    jobjectArray result = (*env)->NewObjectArray(env, found, objClass, NULL);
-    if (result == NULL) {
-        if (objects) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) objects);
-        if (tagsOut) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) tagsOut);
-        if (col.tags) free(col.tags);
-        return NULL;
-    }
-
-    for (jint i = 0; i < found; i++) {
-        jobject o = objects[i];
-        (*env)->SetObjectArrayElement(env, result, i, o);
-        if (o) (*env)->DeleteLocalRef(env, o);
-    }
-
-    if (objects) {
-        jvmtiError derr = (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) objects);
-        check_print(g_jvmti, derr, "Deallocate(objects) failed");
-    }
-    if (tagsOut) {
-        jvmtiError derr = (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) tagsOut);
-        check_print(g_jvmti, derr, "Deallocate(tagsOut) failed");
-    }
-    if (col.tags) free(col.tags);
-
-    return result;
+    return resolve_walk_tag(env, walk_tag);
 }
 
 /**
- * Walks the heap filtered by specific class names.
- * More efficient than full heap walk when only specific classes are needed.
+ * Walks the heap filtered by specific classes.
  *
- * @param classNamesArray Array of internal class names (e.g., "service/model/OldUser")
+ * All target classes are tagged within a single walk using the shared per-walk tag,
+ * then resolved in one GetObjectsWithTags(count=1) call. Classes are passed as jclass
+ * objects resolved by the Java caller, so they are found regardless of classloader.
+ *
+ * @param classesArray Array of target classes
  * @return Array of objects matching the specified classes, or NULL on error
  */
 JNIEXPORT jobjectArray JNICALL
 Java_migrator_heap_NativeHeapWalker_nativeWalkHeapFiltered(
-    JNIEnv *env, jobject thisObj, jobjectArray classNamesArray) {
+    JNIEnv *env, jobject thisObj, jobjectArray classesArray) {
 
     (void) thisObj;
 
-    if (!g_jvmti || !env || classNamesArray == NULL) return NULL;
+    if (!g_jvmti || !env || classesArray == NULL) return NULL;
 
-    jsize nClasses = (*env)->GetArrayLength(env, classNamesArray);
+    jsize nClasses = (*env)->GetArrayLength(env, classesArray);
     if (nClasses == 0) return NULL;
 
-    jobject *collected = NULL;
-    jint collectedCount = 0;
-    jint collectedCap = 0;
+    jlong walk_tag = WALK_TAG(__sync_add_and_fetch(&g_epoch, 1));
+
+    jvmtiHeapCallbacks callbacks;
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.heap_iteration_callback = &heap_tagging_cb;
 
     for (jsize ci = 0; ci < nClasses; ci++) {
-        jstring jName = (jstring)(*env)->GetObjectArrayElement(env, classNamesArray, ci);
-        if (jName == NULL) continue;
+        jclass targetClass = (jclass)(*env)->GetObjectArrayElement(env, classesArray, ci);
+        if (targetClass == NULL) continue;
 
-        const char* cname = (*env)->GetStringUTFChars(env, jName, NULL);
-        if (cname == NULL) {
-            (*env)->DeleteLocalRef(env, jName);
-            continue;
-        }
-
-        jclass targetClass = (*env)->FindClass(env, cname);
-        (*env)->ReleaseStringUTFChars(env, jName, cname);
-        (*env)->DeleteLocalRef(env, jName);
-
-        if (targetClass == NULL) {
-            if ((*env)->ExceptionCheck(env)) {
-                (*env)->ExceptionClear(env);
-            }
-            continue;
-        }
-
-        __sync_fetch_and_add(&g_epoch, 1);
-        __sync_synchronize();
-        g_local_counter = 1;
-
-        tag_collector_t col;
-        memset(&col, 0, sizeof(col));
-
-        jvmtiHeapCallbacks callbacks;
-        memset(&callbacks, 0, sizeof(callbacks));
-        callbacks.heap_iteration_callback = &heap_tagging_cb;
-
-        jvmtiError err = (*g_jvmti)->IterateThroughHeap(g_jvmti, JVMTI_HEAP_OBJECT_EITHER, targetClass, &callbacks, &col);
+        /* Tag instances of this class with the shared per-walk tag. The tag check in
+         * heap_tagging_cb makes a re-tag a no-op when an object matches several target
+         * classes (e.g. via inheritance). */
+        jvmtiError err = (*g_jvmti)->IterateThroughHeap(g_jvmti, HEAP_FILTER_NONE,
+                                                         targetClass, &callbacks, &walk_tag);
         if (err != JVMTI_ERROR_NONE) {
             check_print(g_jvmti, err, "IterateThroughHeap failed for class");
-            if (col.tags) free(col.tags);
-            (*env)->DeleteLocalRef(env, targetClass);
-            continue;
         }
-
-        jint count = col.count;
-        if (count <= 0) {
-            if (col.tags) free(col.tags);
-            (*env)->DeleteLocalRef(env, targetClass);
-            continue;
-        }
-
-        jint found = 0;
-        jobject *objs = NULL;
-        jlong *tagsOut = NULL;
-
-        err = (*g_jvmti)->GetObjectsWithTags(g_jvmti, count, col.tags, &found, &objs, &tagsOut);
-        if (err != JVMTI_ERROR_NONE) {
-            check_print(g_jvmti, err, "GetObjectsWithTags failed for class");
-            if (col.tags) free(col.tags);
-            (*env)->DeleteLocalRef(env, targetClass);
-            continue;
-        }
-
-        if (found > 0 && objs != NULL) {
-            if (collectedCount + found > collectedCap) {
-                jint newCap = collectedCap == 0 ? (found + 64) : (collectedCap * 2 + found);
-                jobject *tmp = (jobject*) realloc(collected, sizeof(jobject) * (size_t)newCap);
-                if (!tmp) {
-                    for (jint i = 0; i < found; i++) {
-                        if (objs[i]) (*env)->DeleteLocalRef(env, objs[i]);
-                    }
-                    if (objs) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) objs);
-                    if (tagsOut) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) tagsOut);
-                    if (col.tags) free(col.tags);
-                    free(collected);
-                    (*env)->DeleteLocalRef(env, targetClass);
-                    return NULL;
-                }
-                collected = tmp;
-                collectedCap = newCap;
-            }
-
-            for (jint i = 0; i < found; i++) {
-                collected[collectedCount++] = objs[i];
-            }
-        }
-
-        if (objs) {
-            jvmtiError derr = (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) objs);
-            check_print(g_jvmti, derr, "Deallocate(objects) failed");
-        }
-        if (tagsOut) {
-            jvmtiError derr = (*g_jvmti)->Deallocate(g_jvmti, (unsigned char*) tagsOut);
-            check_print(g_jvmti, derr, "Deallocate(tagsOut) failed");
-        }
-        if (col.tags) free(col.tags);
 
         (*env)->DeleteLocalRef(env, targetClass);
     }
 
-    if (collectedCount == 0) {
-        if (collected) free(collected);
-        return NULL;
-    }
-
-    jclass objClass = (*env)->FindClass(env, "java/lang/Object");
-    if (objClass == NULL) {
-        for (jint i = 0; i < collectedCount; i++) {
-            if (collected[i]) (*env)->DeleteLocalRef(env, collected[i]);
-        }
-        free(collected);
-        return NULL;
-    }
-
-    jobjectArray result = (*env)->NewObjectArray(env, collectedCount, objClass, NULL);
-    if (result == NULL) {
-        for (jint i = 0; i < collectedCount; i++) {
-            if (collected[i]) (*env)->DeleteLocalRef(env, collected[i]);
-        }
-        free(collected);
-        return NULL;
-    }
-
-    for (jint i = 0; i < collectedCount; i++) {
-        jobject o = collected[i];
-        (*env)->SetObjectArrayElement(env, result, i, o);
-        if (o) (*env)->DeleteLocalRef(env, o);
-    }
-
-    free(collected);
-    return result;
+    return resolve_walk_tag(env, walk_tag);
 }
 
 /**

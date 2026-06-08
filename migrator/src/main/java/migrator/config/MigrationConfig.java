@@ -22,6 +22,7 @@ import java.time.Duration;
  */
 public final class MigrationConfig {
 
+    /** Configuration with all defaults: filtered (SPEC) heap walk, no timeouts, WARNING alerts, history size 10. */
     public static final MigrationConfig DEFAULTS = builder().build();
 
     private final HeapWalkMode heapWalkMode;
@@ -90,6 +91,9 @@ public final class MigrationConfig {
         return "MigrationConfig{" +
                 "heapWalkMode=" + heapWalkMode +
                 ", heapWalkTimeout=" + heapWalkTimeout.toSeconds() + "s" +
+                ", heapSnapshotTimeout=" + heapSnapshotTimeout.toSeconds() + "s" +
+                ", criticalPhaseTimeout=" + criticalPhaseTimeout.toSeconds() + "s" +
+                ", smokeTestTimeout=" + smokeTestTimeout.toSeconds() + "s" +
                 ", minHeapSizeMb=" + minHeapSizeMb +
                 ", maxHeapSizeMb=" + maxHeapSizeMb +
                 ", historySize=" + historySize +
@@ -101,7 +105,7 @@ public final class MigrationConfig {
      * Builder for constructing {@link MigrationConfig} instances.
      */
     public static final class Builder {
-        private HeapWalkMode heapWalkMode = HeapWalkMode.FULL;
+        private HeapWalkMode heapWalkMode = HeapWalkMode.SPEC;
         private Duration heapWalkTimeout = Duration.ZERO;
         private Duration heapSnapshotTimeout = Duration.ZERO;
         private Duration criticalPhaseTimeout = Duration.ZERO;
@@ -112,12 +116,12 @@ public final class MigrationConfig {
         private AlertLevel alertLevel = AlertLevel.WARNING;
 
         public Builder heapWalkMode(HeapWalkMode mode) {
-            this.heapWalkMode = mode;
+            this.heapWalkMode = mode != null ? mode : HeapWalkMode.SPEC;
             return this;
         }
 
         public Builder heapWalkTimeout(Duration timeout) {
-            this.heapWalkTimeout = timeout;
+            this.heapWalkTimeout = timeout != null ? timeout : Duration.ZERO;
             return this;
         }
 
@@ -126,7 +130,7 @@ public final class MigrationConfig {
         }
 
         public Builder heapSnapshotTimeout(Duration timeout) {
-            this.heapSnapshotTimeout = timeout;
+            this.heapSnapshotTimeout = timeout != null ? timeout : Duration.ZERO;
             return this;
         }
 
@@ -135,7 +139,7 @@ public final class MigrationConfig {
         }
 
         public Builder criticalPhaseTimeout(Duration timeout) {
-            this.criticalPhaseTimeout = timeout;
+            this.criticalPhaseTimeout = timeout != null ? timeout : Duration.ZERO;
             return this;
         }
 
@@ -144,7 +148,7 @@ public final class MigrationConfig {
         }
 
         public Builder smokeTestTimeout(Duration timeout) {
-            this.smokeTestTimeout = timeout;
+            this.smokeTestTimeout = timeout != null ? timeout : Duration.ZERO;
             return this;
         }
 
@@ -178,7 +182,7 @@ public final class MigrationConfig {
         }
 
         public Builder alertLevel(AlertLevel level) {
-            this.alertLevel = level;
+            this.alertLevel = level != null ? level : AlertLevel.WARNING;
             return this;
         }
 

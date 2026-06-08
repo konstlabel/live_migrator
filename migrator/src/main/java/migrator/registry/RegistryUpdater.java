@@ -62,19 +62,50 @@ public final class RegistryUpdater {
         Collection<Class<?>> classesToScan,
         Collection<Object> heapObjects) {
 
+        // Static fields are patched as found; instance fields are collected and applied in a single
+        // pass over the heap (rather than re-scanning the whole heap per field). A field may be
+        // reached through several scanned subclasses of the same superclass, so dedupe by Field.
+        Set<Field> seen = new HashSet<>();
+        List<InstanceRegistrySpec> instanceFields = new ArrayList<>();
+
         for (Class<?> cls : classesToScan) {
-            for (Field f : cls.getDeclaredFields()) {
+            for (Field f : allDeclaredFields(cls)) {
                 UpdateRegistry ann = f.getAnnotation(UpdateRegistry.class);
-                if (ann == null) continue;
+                if (ann == null || !seen.add(f)) continue;
 
                 if (Modifier.isStatic(f.getModifiers())) {
                     patchStaticRegistryField(cls, f, ann);
                 } else {
-                    patchInstanceRegistryField(cls, f, ann, heapObjects);
+                    f.setAccessible(true);
+                    instanceFields.add(new InstanceRegistrySpec(cls, f, ann));
+                }
+            }
+        }
+
+        if (!instanceFields.isEmpty() && heapObjects != null) {
+            for (Object obj : heapObjects) {
+                if (obj == null) continue;
+                for (InstanceRegistrySpec spec : instanceFields) {
+                    if (spec.declaringClass().isInstance(obj)) {
+                        applyInstanceRegistryField(spec, obj);
+                    }
                 }
             }
         }
     }
+
+    /** Returns the declared fields of {@code cls} and all its superclasses (excluding {@code Object}). */
+    private List<Field> allDeclaredFields(Class<?> cls) {
+        List<Field> fields = new ArrayList<>();
+        for (Class<?> c = cls; c != null && c != Object.class; c = c.getSuperclass()) {
+            fields.addAll(Arrays.asList(c.getDeclaredFields()));
+        }
+        return fields;
+    }
+
+    private record InstanceRegistrySpec(Class<?> declaringClass, Field field, UpdateRegistry ann) {}
+
+    private record InstanceGenericSpec(Class<?> declaringClass, Field field, Class<?> interfaceType) {}
 
     /**
      * Updates a generic container that holds elements implementing a common interface.
@@ -172,35 +203,40 @@ public final class RegistryUpdater {
             return;
         }
 
+        // Same shape as updateAnnotatedRegistries: statics handled inline, instance fields applied
+        // in a single heap pass, fields deduped across subclasses sharing a superclass field.
+        Set<Field> seen = new HashSet<>();
+        List<InstanceGenericSpec> instanceFields = new ArrayList<>();
+
         for (Class<?> cls : classesToScan) {
-            updateGenericFieldsInClass(cls, heapObjects, interfaceTypes);
-        }
-    }
+            for (Field field : allDeclaredFields(cls)) {
+                if (!seen.add(field)) continue;
 
-    /**
-     * Scans a single class for generic fields and updates them.
-     */
-    private void updateGenericFieldsInClass(
-            Class<?> cls,
-            Collection<Object> heapObjects,
-            Set<Class<?>> interfaceTypes) {
+                Class<?> matchedInterface = extractMatchingInterfaceType(field.getGenericType(), interfaceTypes);
+                if (matchedInterface == null) {
+                    continue;
+                }
 
-        for (Field field : cls.getDeclaredFields()) {
-            Type genericType = field.getGenericType();
+                log.debug("Found generic field {}.{} with interface type {}",
+                          cls.getSimpleName(), field.getName(), matchedInterface.getSimpleName());
 
-            // Extract interface type from generic type parameter
-            Class<?> matchedInterface = extractMatchingInterfaceType(genericType, interfaceTypes);
-            if (matchedInterface == null) {
-                continue;
+                if (Modifier.isStatic(field.getModifiers())) {
+                    updateStaticGenericField(cls, field, matchedInterface);
+                } else {
+                    field.setAccessible(true);
+                    instanceFields.add(new InstanceGenericSpec(cls, field, matchedInterface));
+                }
             }
+        }
 
-            log.debug("Found generic field {}.{} with interface type {}",
-                      cls.getSimpleName(), field.getName(), matchedInterface.getSimpleName());
-
-            if (Modifier.isStatic(field.getModifiers())) {
-                updateStaticGenericField(cls, field, matchedInterface);
-            } else {
-                updateInstanceGenericField(cls, field, heapObjects, matchedInterface);
+        if (!instanceFields.isEmpty()) {
+            for (Object obj : heapObjects) {
+                if (obj == null) continue;
+                for (InstanceGenericSpec spec : instanceFields) {
+                    if (spec.declaringClass().isInstance(obj)) {
+                        applyInstanceGenericField(spec, obj);
+                    }
+                }
             }
         }
     }
@@ -221,9 +257,12 @@ public final class RegistryUpdater {
         for (Type typeArg : typeArgs) {
             Class<?> typeArgClass = resolveTypeArgToClass(typeArg);
             if (typeArgClass != null) {
-                // Check if this type arg matches any of the interface types
+                // Check if this type arg matches any of the interface types. The reverse
+                // (type arg is a supertype of the interface, e.g. List<AbstractUser> for User)
+                // is allowed too, but Object is excluded so List<Object> doesn't match everything.
                 for (Class<?> interfaceType : interfaceTypes) {
-                    if (interfaceType.isAssignableFrom(typeArgClass) || typeArgClass.isAssignableFrom(interfaceType)) {
+                    if (interfaceType.isAssignableFrom(typeArgClass)
+                            || (typeArgClass != Object.class && typeArgClass.isAssignableFrom(interfaceType))) {
                         return interfaceType;
                     }
                 }
@@ -277,34 +316,20 @@ public final class RegistryUpdater {
         }
     }
 
-    /**
-     * Updates instance generic fields across all heap objects of the declaring class.
-     */
-    private void updateInstanceGenericField(
-            Class<?> declaringClass,
-            Field field,
-            Collection<Object> heapObjects,
-            Class<?> interfaceType) {
-
-        field.setAccessible(true);
-
-        for (Object obj : heapObjects) {
-            if (obj == null || !declaringClass.isInstance(obj)) {
-                continue;
+    /** Updates one instance generic field on a single heap object. */
+    private void applyInstanceGenericField(InstanceGenericSpec spec, Object obj) {
+        try {
+            Object container = spec.field().get(obj);
+            if (container != null) {
+                updateGenericContainer(container, spec.interfaceType());
             }
-
-            try {
-                Object container = field.get(obj);
-                if (container != null) {
-                    updateGenericContainer(container, interfaceType);
-                }
-            } catch (Exception e) {
-                log.warn("Failed to update instance generic field {}.{} on object: {}",
-                         declaringClass.getName(), field.getName(), e.getMessage());
-            }
+        } catch (Exception e) {
+            log.warn("Failed to update instance generic field {}.{} on object: {}",
+                     spec.declaringClass().getName(), spec.field().getName(), e.getMessage());
         }
     }
 
+    /** Replaces keys/values of the map that are instances of {@code interfaceType} with their migrated versions. */
     private void updateGenericMap(Map<?, ?> map, Class<?> interfaceType) {
         if (map == null || map.isEmpty()) {
             return;
@@ -348,6 +373,7 @@ public final class RegistryUpdater {
         }
     }
 
+    /** Dispatches to the list or set update path for a collection of {@code interfaceType} elements. */
     private void updateGenericCollection(Collection<?> collection, Class<?> interfaceType) {
         if (collection == null || collection.isEmpty()) {
             return;
@@ -361,6 +387,7 @@ public final class RegistryUpdater {
     }
 
     @SuppressWarnings("unchecked")
+    /** Replaces, in place by index, list elements of {@code interfaceType} with their migrated versions. */
     private void updateGenericList(List<?> list, Class<?> interfaceType) {
         List<Object> mutableList = (List<Object>) list;
 
@@ -382,33 +409,61 @@ public final class RegistryUpdater {
     }
 
     @SuppressWarnings("unchecked")
+    /**
+     * Replaces set elements of {@code interfaceType} with their migrated versions by rebuilding the
+     * collection in iteration order. Avoids {@code removeAll}/{@code addAll}, which is O(n²) on a
+     * same-size set and matches by equals/hashCode rather than identity (and reorders ordered sets).
+     */
     private void updateGenericSet(Collection<?> collection, Class<?> interfaceType) {
         Collection<Object> mutableCollection = (Collection<Object>) collection;
 
-        List<Object> toRemove = new ArrayList<>();
-        List<Object> toAdd = new ArrayList<>();
+        List<Object> newContents = new ArrayList<>(mutableCollection.size());
+        boolean changed = false;
 
         for (Object element : mutableCollection) {
+            Object replacement = null;
             if (interfaceType.isInstance(element)) {
-                Object replacement = forwarding.get(element);
-                if (replacement != null && replacement != element) {
-                    toRemove.add(element);
-                    toAdd.add(replacement);
+                Object r = forwarding.get(element);
+                if (r != null && r != element) {
+                    replacement = r;
                 }
+            }
+            if (replacement != null) {
+                newContents.add(replacement);
+                changed = true;
+            } else {
+                newContents.add(element);
             }
         }
 
-        if (!toRemove.isEmpty()) {
+        if (changed) {
+            replaceCollectionContents(mutableCollection, newContents);
+        }
+    }
+
+    /**
+     * Replaces the contents of {@code target} with {@code newContents} as an in-place rebuild
+     * ({@code clear()} then {@code addAll()}). If {@code addAll} fails after the {@code clear}
+     * (e.g. a sorted collection whose migrated element breaks the comparator), the original
+     * contents are restored so a failed rebuild never leaves the registry empty or half-populated.
+     */
+    private static void replaceCollectionContents(Collection<Object> target, List<Object> newContents) {
+        List<Object> original = new ArrayList<>(target);
+        try {
+            target.clear();
+            target.addAll(newContents);
+        } catch (RuntimeException e) {
+            log.warn("Failed to rebuild collection ({}); restoring original contents", e.toString());
             try {
-                mutableCollection.removeAll(toRemove);
-                mutableCollection.addAll(toAdd);
-                log.trace("Replaced {} elements in collection", toRemove.size());
-            } catch (Exception e) {
-                log.warn("Failed to update collection: {}", e.getMessage());
+                target.clear();
+                target.addAll(original);
+            } catch (RuntimeException restoreEx) {
+                log.error("Failed to restore collection after a failed rebuild; it may be left partial", restoreEx);
             }
         }
     }
 
+    /** Replaces, in place by index, array elements of {@code interfaceType} with their migrated versions. */
     private void updateGenericArray(Object array, Class<?> interfaceType) {
         if (array == null) {
             return;
@@ -432,6 +487,7 @@ public final class RegistryUpdater {
         }
     }
 
+    /** Best-effort update of a non-JDK container: replaces matching fields and recurses into collection-like fields. */
     private void updateCustomGenericContainer(Object container, Class<?> interfaceType) {
         Class<?> containerClass = container.getClass();
 
@@ -474,6 +530,7 @@ public final class RegistryUpdater {
         }
     }
 
+    /** For an opaque Iterable, deep-patches each matching element's internals (the structure can't be rewritten). */
     private void updateGenericIterable(Iterable<?> iterable, Class<?> interfaceType) {
         // For generic iterables, we can only patch the objects themselves
         // since we can't modify the iterable structure without knowing its type
@@ -485,26 +542,34 @@ public final class RegistryUpdater {
         }
     }
 
+    /** Patches an {@code @UpdateRegistry} static field by type (Map/Collection/array/custom) per the annotation. */
     private void patchStaticRegistryField(Class<?> owner, Field field, UpdateRegistry ann) {
         try {
             field.setAccessible(true);
             Object registry = field.get(null);
             if (registry == null) return;
 
-            // If the static reference itself points to an old object, replace it
+            // If the static reference itself points to an old object, replace it. Isolate this:
+            // a static-final or type-mismatched field can't be reassigned, but we can still patch
+            // the existing registry's contents below.
             Object directReplacement = forwarding.get(registry);
-            if (directReplacement != null) {
-                field.set(null, directReplacement);
-                registry = directReplacement;
+            if (directReplacement != null && directReplacement != registry) {
+                try {
+                    field.set(null, directReplacement);
+                    registry = directReplacement;
+                } catch (IllegalAccessException | IllegalArgumentException e) {
+                    log.warn("Could not replace static registry field {}#{} reference: {}",
+                            owner.getName(), field.getName(), e.getMessage());
+                }
             }
 
             // Process by type
             if (registry instanceof Map) {
-                patchMap((Map<?, ?>) registry, ann.replaceKeys(), ann.replaceValues());
+                patchMap((Map<?, ?>) registry, ann.replaceKeys(), ann.replaceValues(), ann.deep());
             } else if (registry instanceof Collection) {
-                patchCollection((Collection<?>) registry);
+                patchCollection((Collection<?>) registry, ann.deep());
             } else if (registry.getClass().isArray()) {
-                patchArray(registry);
+                patchArray(registry, ann.deep());
             } else {
                 // Best-effort for custom registries:
                 // 1) Try to recursively patch internals (deep)
@@ -519,11 +584,14 @@ public final class RegistryUpdater {
 
             if (registry instanceof RegistryAware aware)
                 safelyNotifyRegistryUpdated(aware, owner, field.getName());
-        } catch (IllegalAccessException e) {
-            throw new IllegalStateException("Failed to read static field " + owner.getName() + "#" + field.getName(), e);
+        } catch (IllegalAccessException | IllegalArgumentException e) {
+            // best-effort: one inaccessible or type-mismatched registry field must not abort the
+            // whole migration.
+            log.warn("Failed to read static registry field {}#{}: {}", owner.getName(), field.getName(), e.getMessage());
         }
     }
 
+    /** Invokes the {@link RegistryAware} callback, isolating (logging) any exception it throws. */
     private void safelyNotifyRegistryUpdated(RegistryAware aware, Class<?> owner, String fieldName) {
         try {
             aware.onRegistryUpdated();
@@ -537,73 +605,63 @@ public final class RegistryUpdater {
         }
     }
 
-    private void patchInstanceRegistryField(
-        Class<?> declaringClass,
-        Field field,
-        UpdateRegistry ann,
-        Collection<Object> heapObjects) {
+    /** Patches one instance {@code @UpdateRegistry} field on a single heap object. */
+    private void applyInstanceRegistryField(InstanceRegistrySpec spec, Object obj) {
+        Field field = spec.field();
+        try {
+            Object value = field.get(obj);
+            if (value == null) return;
 
-        field.setAccessible(true);
-
-        for (Object obj : heapObjects) {
-            if (obj == null || !declaringClass.isInstance(obj)) {
-                continue;
+            Object replacement = forwarding.get(value);
+            if (replacement != null && replacement != value) {
+                field.set(obj, replacement);
+            } else {
+                patchRegistryValue(value, spec.ann());
             }
-
-            try {
-                Object value = field.get(obj);
-                if (value != null) {
-                    Object replacement = forwarding.get(value);
-                    if (replacement != null && replacement != value) {
-                        field.set(obj, replacement);
-                    } else {
-                        patchRegistryValue(value, ann);
-                    }
-                }
-            } catch (IllegalAccessException e) {
-                throw new IllegalStateException(
-                        "Failed to patch instance registry field " + field, e
-                );
-            }
+        } catch (IllegalAccessException | IllegalArgumentException e) {
+            // best-effort: skip objects whose registry field can't be accessed or whose
+            // replacement isn't assignable to the field type.
+            log.warn("Failed to patch instance registry field {}: {}", field, e.getMessage());
         }
     }
 
+    /** Patches an instance registry field value by type (Map/Collection/other) per the annotation. */
     private void patchRegistryValue(Object value, UpdateRegistry ann) {
         if (value instanceof Map) {
-            patchMap(
-                    (Map<?, ?>) value,
-                    ann.replaceKeys(),
-                    ann.replaceValues()
-            );
+            patchMap((Map<?, ?>) value, ann.replaceKeys(), ann.replaceValues(), ann.deep());
         } else if (value instanceof Collection) {
-            patchCollection((Collection<?>) value);
-        } else {
-            Object replacement = forwarding.get(value);
-            if (!(replacement != null && replacement != value))
-                referencePatcher.patchObject(value);
+            patchCollection((Collection<?>) value, ann.deep());
+        } else if (value.getClass().isArray()) {
+            patchArray(value, ann.deep());
+        } else if (ann.deep()) {
+            referencePatcher.patchObject(value);
         }
     }
 
     // ---------------- Map ----------------
 
-    private void patchMap(Map<?, ?> rawMap, boolean replaceKeys, boolean replaceValues) {
+    /** Replaces migrated keys/values in the real map (per the flags) and, when {@code deep}, deep-patches remaining values. */
+    @SuppressWarnings("unchecked")
+    private void patchMap(Map<?, ?> rawMap, boolean replaceKeys, boolean replaceValues, boolean deep) {
         if (rawMap == null || rawMap.isEmpty()) {
             return;
         }
 
+        // Patch the REAL map. We iterate a snapshot of the entries (taken before any
+        // mutation) so that remove/put against the live map can't throw
+        // ConcurrentModificationException. Earlier this built and mutated a throwaway
+        // HashMap copy, so the real registry was never updated.
+        Map<Object, Object> target = (Map<Object, Object>) rawMap;
         List<Map.Entry<Object, Object>> snapshot = createSnapshot(rawMap);
-
-        Map<Object, Object> mutableMap = new HashMap<>();
-        for (Map.Entry<?, ?> e : rawMap.entrySet()) {
-            mutableMap.put(e.getKey(), e.getValue());
-        }
-
         boolean isConcurrent = rawMap instanceof ConcurrentMap;
 
-        patchEntries(snapshot, mutableMap, isConcurrent, replaceKeys, replaceValues);
-        deepPatchValues(mutableMap);
+        patchEntries(snapshot, target, isConcurrent, replaceKeys, replaceValues);
+        if (deep) {
+            deepPatchValues(target);
+        }
     }
 
+    /** Copies a map's entries into a list so the map can be mutated without ConcurrentModificationException. */
     private List<Map.Entry<Object, Object>> createSnapshot(Map<?, ?> map) {
         List<Map.Entry<Object, Object>> entries = new ArrayList<>();
         for (Map.Entry<?, ?> e : map.entrySet()) {
@@ -612,6 +670,7 @@ public final class RegistryUpdater {
         return entries;
     }
 
+    /** Applies key/value replacements for each snapshot entry to the target map, with a fallback on failure. */
     private void patchEntries(
         List<Map.Entry<Object, Object>> entries,
         Map<Object, Object> map,
@@ -641,6 +700,7 @@ public final class RegistryUpdater {
         }
     }
 
+    /** Replaces a single entry in a ConcurrentMap using atomic replace/remove+put as appropriate. */
     private void patchConcurrent(ConcurrentMap<Object, Object> cmap,
                              Object oldKey, Object oldVal,
                              Object newKey, Object newVal) {
@@ -657,6 +717,7 @@ public final class RegistryUpdater {
         }
     }
 
+    /** Replaces a single entry in a non-concurrent map via remove-then-put. */
     private void patchRegular(Map<Object, Object> map,
                             Object oldKey, Object newKey,
                             Object oldVal, Object newVal) {
@@ -667,38 +728,24 @@ public final class RegistryUpdater {
         map.put(putKey, putVal);
     }
 
+    /** Deep-patches the internal references of every value remaining in the map. */
     private void deepPatchValues(Map<?, ?> map) {
         for (Object value : map.values()) {
             referencePatcher.patchObject(value);
         }
     }
 
+    /** Last-resort entry replacement for maps that reject remove/put, via entrySet iteration. */
     private void tryFallbackMapReplace(
-        Map<Object, Object> map, 
-        Object oldKey, 
-        Object newKey, 
-        Object oldVal, 
+        Map<Object, Object> map,
+        Object oldKey,
+        Object newKey,
+        Object oldVal,
         Object newVal) {
         try {
-            List<Map.Entry<Object, Object>> toReinsert = new ArrayList<>();
-
-            for (Map.Entry<Object, Object> entry : map.entrySet()) {
-                if (entry.getKey() == oldKey) {
-                    toReinsert.add(new AbstractMap.SimpleEntry<>(
-                        newKey != null ? newKey : oldKey,
-                        newVal != null ? newVal : oldVal
-                    ));
-                }
-            }
-
             map.entrySet().removeIf(e -> e.getKey() == oldKey);
             map.put(newKey != null ? newKey : oldKey,
                     newVal != null ? newVal : oldVal);
-
-
-            for (Map.Entry<Object, Object> e : toReinsert) {
-                map.put(e.getKey(), e.getValue());
-            }
         } catch (Exception ignore) {
             // best-effort
         }
@@ -706,49 +753,57 @@ public final class RegistryUpdater {
 
     // ---------------- Collection ----------------
 
-    private void patchCollection(Collection<?> rawCollection) {
+    /** Patches a registry collection in place: replaces migrated elements and (when {@code deep}) deep-patches the rest. */
+    @SuppressWarnings("unchecked")
+    private void patchCollection(Collection<?> rawCollection, boolean deep) {
         if (rawCollection == null || rawCollection.isEmpty()) {
             return;
         }
 
-        Collection<Object> collection = asObjectCollection(rawCollection);
-        if (collection == null) {
-            return;
-        }
+        // Patch the REAL collection in place. Earlier this copied into a new ArrayList
+        // and mutated the copy, so element replacements never reached the registry.
+        Collection<Object> collection = (Collection<Object>) rawCollection;
 
         if (collection instanceof List) {
-            List<Object> list = (List<Object>) collection;
-            patchListInPlace(list);
+            patchListInPlace((List<Object>) collection, deep);
         } else {
-            patchGenericCollection(collection);
+            patchGenericCollection(collection, deep);
         }
     }
 
-    private Collection<Object> asObjectCollection(Collection<?> raw) {
-        if (raw == null || raw.isEmpty()) {
-            return List.of();
-        }
-
-        Collection<Object> result = new ArrayList<>(raw.size());
-        for (Object o : raw) {
-            result.add(o); // safe, everything casts to Object
-        }
-        return result;
-    }
-
-    private void patchListInPlace(List<Object> list) {
-        for (int i = 0; i < list.size(); i++) {
-            Object value = list.get(i);
-            Object replacement = forwarding.get(value);
-
-            if (replacement != null && replacement != value) {
-                safelyReplaceAtIndex(list, i, replacement);
-            } else {
-                referencePatcher.patchObject(value);
+    /** Replaces migrated list elements in place; (when {@code deep}) deep-patches the rest. */
+    private void patchListInPlace(List<Object> list, boolean deep) {
+        // RandomAccess lists are cheapest by index; sequential lists (LinkedList) use a
+        // ListIterator to stay O(n) instead of O(n²).
+        if (list instanceof RandomAccess) {
+            for (int i = 0; i < list.size(); i++) {
+                Object value = list.get(i);
+                Object replacement = (value != null) ? forwarding.get(value) : null;
+                if (replacement != null && replacement != value) {
+                    safelyReplaceAtIndex(list, i, replacement);
+                } else if (deep && value != null) {
+                    referencePatcher.patchObject(value);
+                }
+            }
+        } else {
+            ListIterator<Object> it = list.listIterator();
+            while (it.hasNext()) {
+                Object value = it.next();
+                Object replacement = (value != null) ? forwarding.get(value) : null;
+                if (replacement != null && replacement != value) {
+                    try {
+                        it.set(replacement);
+                    } catch (Exception e) {
+                        log.warn("Failed to replace list element: {}", e.getMessage());
+                    }
+                } else if (deep && value != null) {
+                    referencePatcher.patchObject(value);
+                }
             }
         }
     }
 
+    /** Sets a list element by index, falling back to remove+add (e.g. for CopyOnWriteArrayList). */
     private void safelyReplaceAtIndex(List<Object> list, int index, Object newValue) {
         try {
             list.set(index, newValue);
@@ -763,53 +818,37 @@ public final class RegistryUpdater {
         }
     }
 
-    private void patchGenericCollection(Collection<Object> col) {
-        List<Object> toRemove = new ArrayList<>();
-        List<Object> toAdd = new ArrayList<>();
+    /**
+     * Replaces migrated elements of a non-list collection by rebuilding it in iteration order;
+     * (when {@code deep}) deep-patches the rest. Avoids removeAll/addAll (O(n²) on a same-size set,
+     * equals-based, order-destroying — see {@link #updateGenericSet}).
+     */
+    private void patchGenericCollection(Collection<Object> col, boolean deep) {
+        List<Object> newContents = new ArrayList<>(col.size());
+        boolean changed = false;
 
-        // First pass: collect changes
         for (Object value : col) {
-            Object replacement = forwarding.get(value);
+            Object replacement = (value != null) ? forwarding.get(value) : null;
             if (replacement != null && replacement != value) {
-                toRemove.add(value);
-                toAdd.add(replacement);
+                newContents.add(replacement);
+                changed = true;
             } else {
-                referencePatcher.patchObject(value);
-            }
-        }
-
-        // Apply changes as safely as possible
-        safelyBulkReplace(col, toRemove, toAdd);
-    }
-
-    private void safelyBulkReplace(Collection<Object> col, List<Object> toRemove, List<Object> toAdd) {
-        if (toRemove.isEmpty()) {
-            return;
-        }
-
-        try {
-            col.removeAll(toRemove);
-            col.addAll(toAdd);
-        } catch (Exception e) {
-            // Safest fallback for most collections
-            try {
-                Iterator<Object> iterator = col.iterator();
-                while (iterator.hasNext()) {
-                    Object current = iterator.next();
-                    if (toRemove.contains(current)) {
-                        iterator.remove();
-                    }
+                newContents.add(value);
+                if (deep && value != null) {
+                    referencePatcher.patchObject(value);
                 }
-                col.addAll(toAdd);
-            } catch (Exception ignored) {
-                // best-effort
             }
+        }
+
+        if (changed) {
+            replaceCollectionContents(col, newContents);
         }
     }
 
     // ---------------- Array ----------------
 
-    private void patchArray(Object array) {
+    /** Replaces migrated elements of an object array in place; (when {@code deep}) deep-patches the rest. */
+    private void patchArray(Object array, boolean deep) {
         if (array == null) {
             return;
         }
@@ -817,15 +856,16 @@ public final class RegistryUpdater {
         int len = Array.getLength(array);
         for (int i = 0; i < len; i++) {
             Object value = Array.get(array, i);
-            Object replacement = forwarding.get(value);
+            Object replacement = (value != null) ? forwarding.get(value) : null;
 
             if (replacement != null && replacement != value) {
                 try {
                     Array.set(array, i, replacement);
-                } catch (Exception e) {
-                    // best-effort
+                } catch (IllegalArgumentException | ArrayStoreException e) {
+                    // replacement not assignable to the array's component type; leave as-is
+                    log.warn("Failed to replace array element at index {}: {}", i, e.getMessage());
                 }
-            } else {
+            } else if (deep && value != null) {
                 referencePatcher.patchObject(value);
             }
         }
@@ -833,6 +873,7 @@ public final class RegistryUpdater {
 
     // ---------------- Reflective ops for custom registries ----------------
 
+    /** For custom registries (when {@code reflective=true}): patches values returned by collection-like getters. */
     private void tryBestReflectiveRegistryOps(Object registry, UpdateRegistry ann) {
         if (registry == null || !ann.reflective()) {
             return;
@@ -846,12 +887,23 @@ public final class RegistryUpdater {
         patchPublicCollectionLikeGetters(registry, clazz, ann);
     }
 
+    /**
+     * @return true if the class exposes a put/replace/remove method (a sign it is a mutable
+     * registry). Matches by name and arity rather than exact {@code Object} parameter types, so
+     * typed registries such as {@code put(String, User)} are detected.
+     */
     private boolean hasAnyModifyingMethod(Class<?> clazz) {
-        return findMethod(clazz, "replace", Object.class, Object.class) != null ||
-            findMethod(clazz, "put", Object.class, Object.class) != null ||
-            findMethod(clazz, "remove", Object.class) != null;
+        for (Method m : clazz.getMethods()) {
+            String name = m.getName();
+            if (m.getParameterCount() >= 1
+                    && (name.equals("put") || name.equals("replace") || name.equals("remove"))) {
+                return true;
+            }
+        }
+        return false;
     }
 
+    /** Invokes each zero-arg getter returning a Map/Collection/array and patches the returned value. */
     private void patchPublicCollectionLikeGetters(
         Object registry,
         Class<?> clazz,
@@ -868,6 +920,7 @@ public final class RegistryUpdater {
     }
 
 
+    /** @return true if {@code m} is a non-static, zero-arg method returning a collection-like type. */
     private boolean isSuitableGetter(Method m) {
         if (Modifier.isStatic(m.getModifiers())) {
             return false;
@@ -880,12 +933,14 @@ public final class RegistryUpdater {
         return isCollectionLike(returnType);
     }
 
+    /** @return true if the type is a Map, Collection, or array. */
     private boolean isCollectionLike(Class<?> type) {
         return Map.class.isAssignableFrom(type) ||
             Collection.class.isAssignableFrom(type) ||
             type.isArray();
     }
 
+    /** Invokes a getter reflectively, returning null on any failure. */
     private Object safelyInvokeGetter(Object registry, Method method) {
         try {
             method.setAccessible(true);
@@ -896,6 +951,7 @@ public final class RegistryUpdater {
         }
     }
 
+    /** Patches a getter-returned value by type (Map/Collection/array), or deep-patches it when {@code deep=true}. */
     private void patchValueIfSupported(Object value, UpdateRegistry ann) {
         if (value == null) {
             return;
@@ -903,35 +959,17 @@ public final class RegistryUpdater {
 
         if (value instanceof Map) {
             Map<?, ?> map = (Map<?, ?>) value;
-            patchMap(map, ann.replaceKeys(), ann.replaceValues());
+            patchMap(map, ann.replaceKeys(), ann.replaceValues(), ann.deep());
         }
         else if (value instanceof Collection) {
             Collection<?> col = (Collection<?>) value;
-            patchCollection(col);
+            patchCollection(col, ann.deep());
         }
         else if (value.getClass().isArray()) {
-            patchArray(value);
+            patchArray(value, ann.deep());
         }
         else if (ann.deep()) {
             referencePatcher.patchObject(value);
-        }
-    }
-
-
-    private Method findMethod(Class<?> rc, String name, Class<?>... params) {
-        try {
-            Method m = rc.getMethod(name, params);
-            m.setAccessible(true);
-            return m;
-        } catch (NoSuchMethodException e) {
-            // try declared
-            try {
-                Method m2 = rc.getDeclaredMethod(name, params);
-                m2.setAccessible(true);
-                return m2;
-            } catch (NoSuchMethodException ex) {
-                return null;
-            }
         }
     }
 }

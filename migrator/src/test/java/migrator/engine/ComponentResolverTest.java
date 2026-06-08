@@ -22,6 +22,9 @@ import java.util.Set;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+/**
+ * Unit tests for {@link ComponentResolver}.
+ */
 @DisplayName("ComponentResolver")
 class ComponentResolverTest {
 
@@ -133,11 +136,20 @@ class ComponentResolverTest {
         }
 
         @Test
-        @DisplayName("should throw when constructor throws")
+        @DisplayName("should throw when constructor throws, surfacing the cause")
         void shouldThrowWhenConstructorThrows() {
             assertThatThrownBy(() -> resolver.resolvePhaseListener(ThrowingCtorPhaseListener.class))
-                    .isInstanceOf(RuntimeException.class)
-                    .hasMessageContaining("Failed to instantiate");
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("Failed to instantiate")
+                    .hasMessageContaining("Constructor failed")
+                    .cause().isInstanceOf(RuntimeException.class).hasMessage("Constructor failed");
+        }
+
+        @Test
+        @DisplayName("should reject a null phase listener class")
+        void shouldRejectNullClass() {
+            assertThatThrownBy(() -> resolver.resolvePhaseListener(null))
+                    .isInstanceOf(IllegalStateException.class);
         }
     }
 
@@ -164,6 +176,15 @@ class ComponentResolverTest {
         public ThrowingCtorSmokeTest() {
             throw new RuntimeException("Smoke test constructor failed");
         }
+
+        @Override
+        public SmokeTestResult run(Map<MigratorDescriptor, List<Object>> createdPerMigrator) {
+            return SmokeTestResult.ok("never");
+        }
+    }
+
+    public static class NoArgCtorSmokeTest implements SmokeTest {
+        private NoArgCtorSmokeTest(String arg) {} // Not a no-arg constructor
 
         @Override
         public SmokeTestResult run(Map<MigratorDescriptor, List<Object>> createdPerMigrator) {
@@ -218,11 +239,27 @@ class ComponentResolverTest {
         }
 
         @Test
-        @DisplayName("should throw when smoke test constructor throws")
+        @DisplayName("should throw when smoke test constructor throws, surfacing the cause")
         void shouldThrowWhenSmokeTestConstructorThrows() {
             assertThatThrownBy(() -> resolver.resolveSmokeTestRunner(Set.of(ThrowingCtorSmokeTest.class)))
-                    .isInstanceOf(RuntimeException.class)
-                    .hasMessageContaining("Failed to instantiate SmokeTest");
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("Failed to instantiate")
+                    .cause().hasMessage("Smoke test constructor failed");
+        }
+
+        @Test
+        @DisplayName("should give the no-arg-constructor message for a smoke test missing one")
+        void shouldThrowNoArgMessageForSmokeTestWithoutNoArgCtor() {
+            assertThatThrownBy(() -> resolver.resolveSmokeTestRunner(Set.of(NoArgCtorSmokeTest.class)))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("must have a no-arg constructor");
+        }
+
+        @Test
+        @DisplayName("should reject a null smoke test set")
+        void shouldRejectNullSet() {
+            assertThatThrownBy(() -> resolver.resolveSmokeTestRunner(null))
+                    .isInstanceOf(NullPointerException.class);
         }
     }
 
@@ -262,7 +299,7 @@ class ComponentResolverTest {
         void shouldThrowForNonCommitManagerClass() {
             assertThatThrownBy(() -> resolver.resolveCommitManager(InvalidCommitManager.class))
                     .isInstanceOf(IllegalStateException.class)
-                    .hasMessageContaining("@CommitManager must implement CommitManager");
+                    .hasMessageContaining("@CommitComponent must implement CommitManager");
         }
     }
 
@@ -294,7 +331,7 @@ class ComponentResolverTest {
         void shouldThrowForNonRollbackManagerClass() {
             assertThatThrownBy(() -> resolver.resolveRollbackManager(InvalidRollbackManager.class))
                     .isInstanceOf(IllegalStateException.class)
-                    .hasMessageContaining("@RollbackManager must implement RollbackManager");
+                    .hasMessageContaining("@RollbackComponent must implement RollbackManager");
         }
     }
 
