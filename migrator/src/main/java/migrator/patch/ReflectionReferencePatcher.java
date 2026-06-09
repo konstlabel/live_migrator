@@ -50,13 +50,29 @@ public final class ReflectionReferencePatcher implements ReferencePatcher {
     @Override
     public void patchObject(Object obj) {
         if (obj == null) return;
-        // Per-object visited set. A set shared across the whole batch was measurably
-        // slower: it grows to hundreds of thousands of entries and the resulting
-        // IdentityHashMap is cache-hostile, so lookups dominate. Small per-object sets
-        // keep the patch traversal linear and cache-friendly.
+        // Single-root entry point: a fresh per-call visited set. For one root this is the
+        // cheapest option (the set stays as small as the root's reachable subgraph).
         Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
         Deque<Object> work = new ArrayDeque<>();
         enqueue(obj, visited, work);
+        drain(visited, work);
+    }
+
+    /**
+     * Batch entry point (used by the heap-walk patch phase, which passes every migrated-class
+     * instance as a root). Uses <b>one shared visited set + work queue</b> for the whole batch, so
+     * each reachable object is processed exactly once and the total work is {@code O(V+E)}
+     * regardless of how densely the migrated objects reference one another. In-place replacement is
+     * idempotent (guarded by {@code forwarding}), so objects reachable from several roots are
+     * deduplicated without changing the result.
+     */
+    @Override
+    public void patchObjects(Iterable<?> objects) {
+        if (objects == null) return;
+        int sizeHint = (objects instanceof Collection<?> c) ? c.size() : 64;
+        Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>(Math.max(64, sizeHint * 2)));
+        Deque<Object> work = new ArrayDeque<>();
+        for (Object o : objects) enqueue(o, visited, work);
         drain(visited, work);
     }
 

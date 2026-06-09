@@ -10,6 +10,7 @@ public class UserMigrator implements ClassMigrator<OldUser, NewUser> {
 
     @Override
     public NewUser migrate(OldUser old) {
-        return new NewUser(old.id, old.name);
+        // Carry the friends list over; the engine patches its elements (OldUser → NewUser) after.
+        return new NewUser(old.id, old.name, old.friends);
     }
 }

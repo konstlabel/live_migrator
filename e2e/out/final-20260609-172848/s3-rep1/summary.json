@@ -1,0 +1,13 @@
+{
+  "label": "S3-rep1",
+  "rps_target": 1000,
+  "t0_epoch_ms": 1781016200876,
+  "baseline_p99_ms": 4.330,
+  "downtime_sec": 0.000,
+  "recovery_sec": 3.000,
+  "max_p99_ms": 2355.124,
+  "max_latency_ms": 2418.707,
+  "total_requests": 89699,
+  "total_success": 89699,
+  "total_errors": 0
+}

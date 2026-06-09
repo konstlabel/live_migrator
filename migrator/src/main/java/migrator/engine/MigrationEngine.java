@@ -858,7 +858,8 @@ public final class MigrationEngine {
             }
 
             if (objectsToPatch != null && !objectsToPatch.isEmpty()) {
-                // Patch every object returned by the heap walk (each is an independent root).
+                // Patch all objects from the heap walk in one batch (shared visited set, so a
+                // connected migrated graph is traversed once — see patchObjects).
                 referencePatcher.patchObjects(objectsToPatch);
                 return objectsToPatch.size();
             }
