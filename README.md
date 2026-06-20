@@ -480,14 +480,15 @@ Events are logged in a structured, aggregator-friendly format:
 
 ## Performance & guarantees
 
-Migration cost scales with the number of objects involved — not with total heap bytes or the shape of the object graph.
+Migration cost is linear in two things: the number of live objects on the heap (the discovery walk) and the size of the migrated object graph — `V+E` references (the patch). It is **flat** in total heap *bytes*, in object size, and in graph depth/shape — all confirmed by a multi-axis benchmark (see `benchmarks/`).
 
-- **Heap discovery is O(N).** The native agent tags all matching objects with a single per-walk tag and resolves them in one `GetObjectsWithTags` call, avoiding the O(N²) trap of querying many distinct tags. A per-walk epoch keeps each walk's tag distinct from earlier ones.
-- **Filtered ("SPEC") heap walk is the default.** During the critical phase the engine walks only the classes that can hold references to migrated objects, instead of the whole heap. Use `FULL` mode for an exhaustive scan.
+- **Heap discovery is O(heap).** The filtered ("SPEC") walk still visits every live object to apply its class filter, so discovery scales with the *total* live-object count, not just the migrated set. Matching objects are tagged with a single per-walk tag and resolved in one `GetObjectsWithTags` call, avoiding the O(N²) trap of querying many distinct tags; a per-walk epoch keeps each walk's tag distinct from earlier ones.
+- **Filtered ("SPEC") heap walk is the default.** During the critical phase the engine reflectively patches only instances of classes that can hold references to migrated objects, instead of every object on the heap. Use `FULL` mode for an exhaustive scan.
 - **Reference patching is iterative and cycle-safe.** The patcher traverses with an explicit work-stack (not recursion), so deep or large cyclic graphs — linked lists, trees, rings — are patched without `StackOverflowError`; an identity-based visited set prevents reprocessing.
-- **Large objects are cheap.** Primitive bulk arrays are skipped, so migrating a few very large objects costs almost nothing. Whether payload data is copied or shared is up to your `migrate()` (share to avoid duplicating memory).
+- **Large objects are cheap.** Primitive bulk arrays are skipped, so migrating a few very large objects costs almost nothing. Whether payload data is copied or shared is up to your `migrate()`.
+- **Peak memory is ~2× only if you copy.** Old and new objects coexist until commit, so a `migrate()` that *duplicates* state peaks at ≈2× the migrated data (measured), while one that *shares* immutable fields adds only the migration's working set (≈1.3×). Share to avoid doubling memory.
 
-**Indicative numbers** (JDK 26, 16 cores, SPEC mode; see `migrator/src/test/java/migrator/benchmark/`):
+**Indicative numbers** (JDK 26, 16 cores, SPEC mode; standalone probes in `migrator/src/test/java/migrator/benchmark/`, rigorous JMH multi-axis study in `benchmarks/`):
 
 | Workload | Result |
 |----------|--------|
