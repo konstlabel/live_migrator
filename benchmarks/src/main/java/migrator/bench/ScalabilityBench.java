@@ -63,6 +63,18 @@ public class ScalabilityBench {
     @Param({"64"})
     public int payloadSize;
 
+    // Axis N: number of live background objects (a class the migrator never touches) — grows total
+    // heap N at fixed m, isolating the walk's dependence on total heap vs. migrated-instance count.
+    @Param({"0"})
+    public int bgObjects;
+
+    @Param({"64"})
+    public int bgSize;
+
+    // Axis L: edge layout at fixed m/E — "ring" (default), "chain" (depth = m), "star" (depth = 1).
+    @Param({"ring"})
+    public String layout;
+
     private boolean nativeReady;
 
     @Setup(Level.Trial)
@@ -81,7 +93,7 @@ public class ScalabilityBench {
         // m nodes, not uncollected garbage (outside the timed region in SingleShotTime).
         GraphHolder.reset();
         System.gc();
-        GraphHolder.build(m, fanout, payloadSize);
+        GraphHolder.build(m, fanout, payloadSize, layout, bgObjects, bgSize);
     }
 
     @Benchmark
